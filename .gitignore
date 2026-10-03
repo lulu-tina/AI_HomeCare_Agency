@@ -24,3 +24,8 @@ venv/
 .DS_Store
 
 .streamlit/secrets.toml
+# OSRM generated map files
+osrm_motorcycle/data/*.osm.pbf
+osrm_motorcycle/data/*.osrm
+osrm_motorcycle/data/*.osrm.*
+osrm_motorcycle/build_info.json
