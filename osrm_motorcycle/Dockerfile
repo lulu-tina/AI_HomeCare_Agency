@@ -1,4 +1,4 @@
-Rename-Item .\osrm_motorcycle\Dockerfile.txt DockerfileFROM debian:bookworm-slim AS downloader
+FROM debian:bookworm-slim AS downloader
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends curl ca-certificates \
