@@ -2,7 +2,7 @@
 
 將原始三階段流程（適配度評分 -> OR-Tools 最佳化 -> DiD 效益回溯）拆成可
 重複呼叫的函式，並把所有具派單政策意義的係數集中到 PipelineConfig，供
-CLI (ai_caregiver_pipeline.py) 與網頁儀表板 (app.py) 共用同一份邏輯。
+CLI (ai_caregiver_pipeline.py) 與網頁儀錶板 (app.py) 共用同一份邏輯。
 
 另包含 BA 服務代碼併報法規防呆檢核、長照申報點數與居服員拆帳薪資試算、
 星期／可服務時段／請假防呆的硬性條件，以及依日期逐日批次派單的輔助函式。
@@ -11,21 +11,22 @@ CLI (ai_caregiver_pipeline.py) 與網頁儀表板 (app.py) 共用同一份邏輯
 """
 
 import os
-from dataclasses import dataclass
+import re
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from contextvars import ContextVar
 from typing import Optional
 
 import numpy as np
 import pandas as pd
 import requests
+from care_policy import difficulty_reference, certificate_names, certificate_bonus, DEFAULT_CODE_CERTS, REGISTRATION_FIELDS, dementia_status, special_qualification_error
 import streamlit as st
 from ortools.linear_solver import pywraplp
 
 DEFAULT_EXCEL_PATH = "./00_DB/AI_Caregiver_Allocation_Ultimate_Database.xlsx"
   
-# OSRM 公用路網 API：使用道路行車路線作為機車／汽車的初步估算；不含即時路況與公車班次。
-OSRM_HOST = "https://router.project-osrm.org"
-OSRM_PROFILE = "driving"
+# OSRM 僅提供本版自架機車路網；公車／捷運使用其他交通來源。
 OSRM_TIMEOUT_SECONDS = 3.0
 OSRM_TABLE_TIMEOUT_SECONDS = 10.0
 OSRM_TABLE_MAX_COORDS = 90  # 單次 /table 批次查詢座標數上限，避免超出公用伺服器限制
@@ -35,17 +36,69 @@ GOOGLE_ROUTES_URL = (
     "https://routes.googleapis.com/distanceMatrix/v2:computeRouteMatrix"
 )
 
+
 GOOGLE_ROUTES_TIMEOUT_SECONDS = 15.0
 
-# 交通方式 → Google Routes travelMode
-GOOGLE_TRAVEL_MODE_MAP = {
-    "機車": "TWO_WHEELER",
-    "大眾運輸": "TRANSIT",
-    "汽車": "DRIVE",
+# 個資保護：
+# - 排班核心只使用內部 ID，不以姓名作為 key。
+# - 姓名只允許存在於「案家姓名對照／居服員姓名對照」顯示層。
+# - 外部 Google Routes payload 採白名單驗證，只允許座標、時間、交通模式等必要欄位。
+DIRECT_IDENTIFIER_COLUMNS = {
+    "姓名", "個案姓名", "員工姓名", "居服員姓名",
+    "身分證", "身分證字號", "身分證號", "手機", "手機號碼",
+    "電話", "聯絡電話", "地址", "住址", "Email", "email",
+    "電子郵件", "生日", "出生日期",
 }
-# Google 測試安全上限：本次程式執行最多呼叫 Google 10 次
-GOOGLE_TEST_MAX_CALLS = 10
-_GOOGLE_TEST_CALL_COUNT = 0
+
+IDENTITY_SHEET_ALIASES = {
+    "client": ["案家姓名對照", "個案姓名對照", "Client_Mapping", "Client_Name_Mapping"],
+    "caregiver": ["居服員姓名對照", "員工姓名對照", "Caregiver_Mapping", "Caregiver_Name_Mapping"],
+}
+
+def _strip_direct_identifiers(frame, keep=()):
+    """從排班運算資料移除直接識別欄位；保留內部 ID 與運算必要欄位。"""
+    if not isinstance(frame, pd.DataFrame):
+        return frame, []
+    keep = set(keep)
+    drop = [c for c in frame.columns if str(c).strip() in DIRECT_IDENTIFIER_COLUMNS and c not in keep]
+    return frame.drop(columns=drop, errors="ignore"), [str(c) for c in drop]
+
+def _validate_google_routes_payload(body):
+    """外部 Google Routes 僅允許最小必要欄位，避免姓名／電話／地址等欄位誤送。"""
+    allowed_top = {
+        "origins", "destinations", "travelMode", "languageCode",
+        "regionCode", "departureTime", "arrivalTime",
+    }
+    unexpected = set(body) - allowed_top
+    if unexpected:
+        raise ValueError("Google Routes 請求含未允許欄位：" + "、".join(sorted(unexpected)))
+
+    forbidden_tokens = ("name", "姓名", "phone", "電話", "address", "地址", "email", "身分證")
+    def walk(value):
+        if isinstance(value, dict):
+            for key, item in value.items():
+                key_text = str(key).lower()
+                if any(token.lower() in key_text for token in forbidden_tokens):
+                    raise ValueError("Google Routes 請求偵測到直接識別欄位，已阻擋送出")
+                walk(item)
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                walk(item)
+    walk(body)
+
+# Google Routes 僅提供公車／捷運；機車固定走自架 OSRM。
+GOOGLE_TRAVEL_MODE_MAP = {
+    "大眾運輸": "TRANSIT",
+}
+# 每次排班的 Google 查詢上限；達上限明確停止，不替換成直線估算。
+_GOOGLE_QUERY_STATE = ContextVar("careflow_google_queries", default=None)
+_GOOGLE_ALLOWED = ContextVar("careflow_google_allowed", default=True)
+_GOOGLE_COLLECT = ContextVar("careflow_google_collect", default=None)
+
+def set_google_queries_enabled(enabled):
+    """網頁預設關閉；只有明確核對按鈕暫時允許付費查詢。"""
+    _GOOGLE_ALLOWED.set(bool(enabled))
+
 
 # 服務項目強度加權係數：依體力耗費強度分級，用於疲勞度模型。
 SERVICE_INTENSITY_WEIGHT = {
@@ -64,7 +117,7 @@ EXCLUSION_MAP = {
 # 法定 20 小時特照培訓：案家需求類別 -> 合格居服員「核心專長證照」集合。
 # 居服員若不具備對應證照，該配對於 Phase 1 直接硬性剔除，不得派單。
 SPECIAL_CERT_REQUIREMENTS = {
-    "失智引導與精神陪伴": {"失智症照顧專長", "精神疾病照顧專長"},
+    "失智引導與精神陪伴": {"失智症照顧專長"},
 }
 
 # 星期中文名稱 -> ISO 星期數字（1=一 ... 7=日），供「可排班星期」防呆使用。
@@ -73,7 +126,6 @@ WEEKDAY_NAME_TO_NUM = {
     "星期五": 5, "星期六": 6, "星期日": 7,
 }
 WEEKDAY_NUM_TO_NAME = {v: k for k, v in WEEKDAY_NAME_TO_NUM.items()}
-
 
 def get_weekday_name(date_value) -> str:
     """將日期值轉換為中文星期名稱（"星期一"...），供派單結果表格顯示用。
@@ -89,7 +141,7 @@ def get_weekday_name(date_value) -> str:
         return ""
     return WEEKDAY_NUM_TO_NAME.get(parsed.isoweekday(), "")
 
-# 台灣長照 2.0 常用 BA 服務代碼點數（點值，機構申報營收以此試算；1 點通常對應約 1 元）。
+# 臺灣長照 2.0 常用 BA 服務代碼點數（點值，機構申報營收以此試算；1 點通常對應約 1 元）。
 BA_UNIT_POINTS = {
     "BA01": 175,
     "BA02": 210,
@@ -105,7 +157,6 @@ BA_UNIT_POINTS = {
 # 無法由 Service_Code_1/2 判斷點數時（例如資料表未升級至含 BA 碼申報欄位），
 # 退回以服務歷時概算點數：每 30 分鐘 = 150 點。
 _FALLBACK_POINTS_PER_30MIN = 150.0
-
 
 @dataclass
 class PipelineConfig:
@@ -134,6 +185,10 @@ class PipelineConfig:
     # 工作負荷平衡：若資料未提供「當月可排總工時」，預設以 160 小時作為月可用工時基準
     fatigue_reference_hours: float = 160.0
     fatigue_weight: float = 10.0
+    plan_load_mode: str = "hours"
+    solver_time_limit_ms: int = 10000
+    solver_relative_gap: float = 0.01
+    service_unit_prices: dict = field(default_factory=dict)
 
     # Phase 1：車程上限硬性條件（None = 停用，不做硬性剔除）。
     # 照護連續性優先於車程限制：一般候選人受 max_travel_minutes 限制，
@@ -150,7 +205,6 @@ class PipelineConfig:
     # 僅供結果顯示與財務 KPI 試算，不參與派單決策。
     caregiver_salary_rate_per_point: float = 0.65
 
-
 # ==========================================
 # 資料載入
 # ==========================================
@@ -166,10 +220,295 @@ def load_data(excel_path: str = DEFAULT_EXCEL_PATH, tasks_sheet_name: str = "Tod
     df_cg = pd.read_excel(excel_path, sheet_name="Caregiver_Profiles")
     df_cl = pd.read_excel(excel_path, sheet_name="Client_Profiles")
     df_tasks = pd.read_excel(excel_path, sheet_name=tasks_sheet_name)
-    df_hist = pd.read_excel(excel_path, sheet_name="Historical_Service_Logs")
+    xl = pd.ExcelFile(excel_path)
+    df_hist = pd.read_excel(xl,sheet_name='Historical_Service_Logs') if 'Historical_Service_Logs' in xl.sheet_names else pd.DataFrame()
 
-    tasks = df_tasks.merge(df_cl, on="案家ID", how="left")
+    tasks = merge_task_client_tables(df_tasks, df_cl)
     return df_cg, df_cl, df_tasks, df_hist, tasks
+
+# ==========================================
+# 機構三檔匯入：保留來源值，缺少資訊不偽造
+# ==========================================
+def _text(value):
+    return '' if pd.isna(value) else str(value).replace('_x000D_', '').strip()
+
+
+def _number(value, default=np.nan):
+    try:
+        number = float(value)
+        return number if np.isfinite(number) else default
+    except (TypeError, ValueError):
+        return default
+
+
+def _date(value):
+    if not _text(value):
+        return None
+    parsed = pd.to_datetime(value, errors='coerce')
+    return None if pd.isna(parsed) else parsed.date()
+
+
+def _hhmm(value):
+    import re
+    match = re.fullmatch(r'(\d{1,2}):(\d{2})(?::\d{2})?', _text(value))
+    if not match or int(match[1]) > 23 or int(match[2]) > 59:
+        return None
+    return f'{int(match[1]):02d}:{int(match[2]):02d}'
+
+
+def parse_service_items(value):
+    """保留任意數量服務碼與次數（含 BA05-1/BA15-1 等子碼）。"""
+    import re
+    text = _text(value).upper().replace('（', '(').replace('）', ')')
+    pattern = re.compile(r'((?:BA|GA|SC|SA|AA)\d{2}(?:-\d+|[A-Z]\d*)?)\s*\(\s*(\d+(?:\.\d+)?)\s*\)')
+    matches = list(pattern.finditer(text))
+    remainder = pattern.sub('', text).strip(' ,，;；\n\t')
+    if not matches or remainder:
+        raise ValueError('服務項目格式無法完整解析，請使用 BA13(2) BA07(1) 格式')
+    return [(m[1], float(m[2])) for m in matches]
+
+
+def iter_service_codes(row):
+    import re
+    indices = sorted({int(m[1]) for key in row.keys()
+                      if (m := re.match(r'^Service_Code_(\d+)(?:_[xy])?$', str(key)))})
+    for index in indices:
+        code = _get_task_field(row, f'Service_Code_{index}')
+        if code is not None:
+            yield str(code).strip().upper(), _number(_get_task_field(row, f'Units_{index}'))
+
+
+def caregiver_has_cert(cg, cert):
+    return cert in certificate_names(cg) or cert in _text(cg.get('核心專長證照')).split('、')
+
+
+def merge_task_client_tables(tasks, clients):
+    """多對一合併；任務座標優先，保留來源；重複鍵直接報錯。"""
+    if clients['案家ID'].isna().any() or clients['案家ID'].duplicated().any():
+        raise ValueError('案家ID 不可空白或重複；請先修正案家資料')
+    clients = clients.copy()
+    if any(k in clients for k in ['核定等級','失能程度','障礙程度','身障手冊','身障證明']):
+        for field in difficulty_reference({}):
+            clients[field] = clients.apply(lambda row: difficulty_reference(row)[field],axis=1)
+    merged = tasks.merge(clients, on='案家ID', how='left', suffixes=('', '_案家'), validate='many_to_one', indicator=True)
+    if merged['_merge'].eq('left_only').any():
+        raise ValueError('任務有案家ID無法對應個案表，請確認三檔使用同一套代碼')
+    for col in clients.columns:
+        alternate = col + '_案家'
+        if alternate in merged:
+            merged[col] = merged[col].combine_first(merged[alternate])
+    return merged.drop(columns='_merge')
+
+
+def _read_agency_table(file_or_frame):
+    if isinstance(file_or_frame, pd.DataFrame):
+        frame = file_or_frame.copy()
+    else:
+        frame = pd.read_excel(file_or_frame, sheet_name=0, dtype=object)
+    frame.columns = [str(c).strip() for c in frame.columns]
+    return frame
+
+
+def load_agency_data(employee_file, client_file, weekly_file, start_date, end_date,
+                     daily_start='08:00', daily_end='21:00', daily_cap=8.0,
+                     availability_confirmed=False, biweekly_anchor_confirmed=False):
+    """將三個機構檔轉為既有引擎資料表；只產生排班草案，回傳待補資料清單。"""
+    g, c, w = map(_read_agency_table, (employee_file, client_file, weekly_file))
+
+    # 個資保護：姓名／電話／地址等直接識別欄位不進入排班核心。
+    # 內部編號、案號、座標與排班必要欄位保留；姓名由獨立對照 sheet 只用於顯示。
+    privacy_removed = {}
+    g, privacy_removed["員工資料"] = _strip_direct_identifiers(g)
+    c, privacy_removed["個案資料"] = _strip_direct_identifiers(c)
+    w, privacy_removed["週服務計畫"] = _strip_direct_identifiers(w)
+
+    for title, frame, required in [
+        ('員工', g, ['編號', '性別', '休息日', '取得資格', '交通工具']),
+        ('個案', c, ['內部案號']),
+        ('週服務', w, ['案號', '星期', '開始時間', '結束時間', '服務分鐘', '頻率', '生效日', '服務項目'])]:
+        missing = [col for col in required if col not in frame]
+        if missing:
+            raise ValueError(title + '檔缺少欄位：' + '、'.join(missing))
+    start, end = _date(start_date), _date(end_date)
+    if start is None or end is None or end < start or (end-start).days > 30:
+        raise ValueError('請選擇有效日期範圍（最多31天）')
+    if not _hhmm(daily_start) or not _hhmm(daily_end) or daily_end <= daily_start or daily_cap <= 0:
+        raise ValueError('每日可服務時段及工時上限設定無效')
+    issues = []
+    def issue(source, rownum, reason):
+        issues.append({'資料表': source, '來源列': rownum, '問題': reason})
+
+    for source, removed_cols in privacy_removed.items():
+        if removed_cols:
+            issue(source, None, "個資保護：排班運算已移除直接識別欄位：" + "、".join(removed_cols))
+    g['居服員ID'] = g['編號'].map(_text)
+    if g['居服員ID'].eq('').any() or g['居服員ID'].duplicated().any():
+        raise ValueError('員工編號空白或重複，不能安全串檔')
+    c['案家ID'] = c['內部案號'].map(_text)
+    for idx in c.index[c['案家ID'].eq('')]:
+        issue('個案', int(idx)+2, '缺內部案號，暫不匯入；請補原案號後重新匯入')
+    c = c.loc[c['案家ID'].ne('')].copy()
+    if c['案家ID'].duplicated().any():
+        raise ValueError('內部案號重複，不能安全串檔')
+    g['常用交通工具'] = g['交通工具'].map(lambda v: '大眾運輸' if any(x in _text(v) for x in ['公車','捷運','大眾']) else _text(v))
+    for frame, lon, lat in [(g,'服務起點_經度(家)','服務起點_緯度(家)'), (c,'服務地點_經度','服務地點_緯度')]:
+        frame[lon] = pd.to_numeric(frame.get('經度 (WGS84_Lon)', pd.Series(np.nan,index=frame.index)), errors='coerce')
+        frame[lat] = pd.to_numeric(frame.get('緯度 (WGS84_Lat)', pd.Series(np.nan,index=frame.index)), errors='coerce')
+    def certs(v):
+        text = _text(v); result=[]
+        for needle, name in [('失智症照顧服務20小時','失智症照顧專長'),('精神疾病','精神疾病照顧專長'),
+                             ('照顧服務員單一級','單一級照服證照'),('身心障礙支持','身心障礙支持服務核心課程'),('BA08','BA08足部照護')]:
+            if needle in text: result.append(name)
+        return '、'.join(result)
+    g['核心專長證照'] = g['取得資格'].map(certs)
+    def available_days(v):
+        text=_text(v)
+        days={WEEKDAY_NAME_TO_NUM.get(text)}
+        if text.startswith('週') and text[-1:] in '一二三四五六日天':
+            days={7 if text[-1:] in '日天' else '一二三四五六'.index(text[-1:])+1}
+        if not text or None in days:
+            return ''
+        return ','.join(str(n) for n in range(1,8) if n not in days)
+    g['可排班星期'] = g['休息日'].map(available_days)
+    g['每日可服務時段_起'],g['每日可服務時段_迄'] = daily_start,daily_end
+    g['每日工時上限(小時)'] = float(daily_cap)
+    g['可服務資料已確認'] = bool(availability_confirmed)
+    g['可服務設定來源'] = '操作者採用的排班草案假設；非機構提供的可服務時段'
+    for field in ['當月累計服務時數(疲勞度)','歷史滿意度均值','具備重度移位體力(0/1)']:
+        if field not in g: g[field] = np.nan
+    if '失智症個案(0/1)' not in c: c['失智症個案(0/1)'] = np.nan
+    g['本次計畫已排時數'] = 0.0
+    g['本次計畫加權負荷時數'] = 0.0
+    g['特殊排斥條件'] = g.get('特殊排斥條件', '')
+    for field in ['指定居服員性別','特殊照護需求','案家環境特徵','歷史首選居服員ID']:
+        if field not in c: c[field] = ''
+    if '需重度移位協助(0/1)' not in c: c['需重度移位協助(0/1)'] = np.nan
+    for field in ['照護難度參考係數','照護難度判斷依據','照護提示','照護難度規則版本']:
+        c[field] = c.apply(lambda row: difficulty_reference(row)[field],axis=1)
+    c['照護條件待確認'] = True
+    g['請假紀錄'] = pd.Series([None]*len(g),index=g.index,dtype=object)
+    for idx,row in g.iterrows():
+        if _text(row.get('類別')) != '請假': continue
+        begin,finish = _date(row.get('開始')),_date(row.get('結束'))
+        parts = _text(row.get('時間')).split('-')
+        t1,t2 = (_hhmm(p.strip()) for p in parts) if len(parts)==2 else (None,None)
+        if begin is None or finish is None or finish < begin or t1 is None or t2 is None or (begin==finish and t2<=t1):
+            issue('員工', int(idx)+2, '請假區間無效或零時數；此員工暫停派單，請修正來源請假欄位後重新匯入')
+            g.at[idx,'可服務資料已確認'] = False
+            continue
+        g.at[idx,'請假紀錄'] = (begin.isoformat()+' '+t1,finish.isoformat()+' '+t2)
+    known=set(c['案家ID']); expanded=[]
+    for idx,row in w.iterrows():
+        rownum=int(idx)+2; client=_text(row.get('案號'))
+        if not client or client not in known:
+            issue('週服務',rownum,'缺案號或無法對應個案表，暫不產生任務'); continue
+        weekday=WEEKDAY_NAME_TO_NUM.get(_text(row.get('星期')))
+        begin,finish = _date(row.get('生效日')),_date(row.get('到期日'))
+        t1,t2=_hhmm(row.get('開始時間')),_hhmm(row.get('結束時間'))
+        minutes=_number(row.get('服務分鐘'))
+        if weekday is None or begin is None or t1 is None or t2 is None or t2<=t1 or not np.isfinite(minutes) or minutes<=0:
+            issue('週服務',rownum,'星期、生效日、時間或服務分鐘無效，暫不產生任務');continue
+        occupied=(datetime.strptime(t2,'%H:%M')-datetime.strptime(t1,'%H:%M')).total_seconds()/60
+        if minutes!=occupied:
+            issue('週服務',rownum,'服務分鐘與起迄時間不符；暫不產生任務以免低估工時');continue
+        if _text(row.get('到期日')) and finish is None:
+            issue('週服務',rownum,'到期日無法解析，暫不產生任務');continue
+        frequency=_text(row.get('頻率')).replace('隔周', '隔週')
+        if frequency not in ('每週','隔週'):
+            issue('週服務',rownum,'頻率無法辨識，暫不產生任務');continue
+        try: codes=parse_service_items(row.get('服務項目'))
+        except ValueError as exc:
+            issue('週服務',rownum,str(exc));continue
+        if not codes or any(units<=0 for _,units in codes):
+            issue('週服務',rownum,'服務次數必須大於零');continue
+        for day in pd.date_range(start,end):
+            day=day.date()
+            if day.isoweekday()!=weekday or day<begin or (finish and day>finish): continue
+            if frequency=='隔週' and ((day-timedelta(days=day.weekday()))-(begin-timedelta(days=begin.weekday()))).days//7%2: continue
+            record=row.to_dict()
+            record.update({'任務ID':f'W{rownum:04d}_{day:%Y%m%d}','案家ID':client,'日期':day.isoformat(),
+                '星期':WEEKDAY_NUM_TO_NAME[weekday],'時間窗_開始':t1,'時間窗_結束':t2,
+                '服務歷時(分鐘)':minutes,'服務歷時來源':'機構服務分鐘／起迄時間相符',
+                '任務優先級':'一般','是否為週期性任務':True,'來源列':rownum,'資料來源':'機構三檔',
+                '任務待確認事項':'照護需求、性別指定、環境限制及首選居服員未提供；座標精度未確認'})
+            record['服務地點_經度']=_number(row.get('經度 (WGS84_Lon)'))
+            record['服務地點_緯度']=_number(row.get('緯度 (WGS84_Lat)'))
+            for i,(code,units) in enumerate(codes,1):
+                record[f'Service_Code_{i}'],record[f'Units_{i}']=code,units
+            expanded.append(record)
+    task_columns=['任務ID','案家ID','日期','星期','時間窗_開始','時間窗_結束','服務歷時(分鐘)',
+                  '任務優先級','是否為週期性任務','Service_Code_1','Units_1','資料來源']
+    tasks=pd.DataFrame(expanded) if expanded else pd.DataFrame(columns=task_columns)
+    if not tasks.empty:
+        # 同案同日重疊可能是重複計畫或多項併單，保留待確認並阻擋，不自行合併或刪除。
+        tasks['任務資料異常']=''
+        for (_,day), group in tasks.groupby(['案家ID','日期']):
+            ordered=group.sort_values('時間窗_開始')
+            pairs=list(ordered.iterrows())
+            for i,(i1,r1) in enumerate(pairs):
+                for i2,r2 in pairs[i+1:]:
+                    if r2['時間窗_開始'] < r1['時間窗_結束']:
+                        for key in (i1,i2):tasks.at[key,'任務資料異常']='同案同日服務時段重疊，需人工確認'
+        overlap_rows=tasks.loc[tasks['任務資料異常'].ne(''),'來源列'].unique()
+        for rownum in overlap_rows:issue('週服務',int(rownum),'同案同日服務重疊；對應任務暫不派單')
+    all_codes=sorted({code for _,row in tasks.iterrows() for code,_ in iter_service_codes(row)})
+    master=pd.DataFrame({'系統代碼':all_codes,'CareFlow排班分鐘(暫定)':np.nan,'是否納入CareFlow':'待確認','單價':np.nan})
+    master['必要證照'] = master['系統代碼'].map(DEFAULT_CODE_CERTS).fillna('')
+    history=pd.DataFrame(columns=['居服員ID','案家ID','歷史媒合機制(Treatment)','不滿意導致提早結案(0/1)','案家滿意度(1-5)'])
+    return {'Caregiver_Profiles':g,'Client_Profiles':c,'Tasks':tasks,'Historical_Service_Logs':history,
+            'Service_Code':master,'Import_Issues':pd.DataFrame(issues,columns=['資料表','來源列','問題'])}
+
+
+def load_agency_workbook(workbook_file, start_date, end_date, **kwargs):
+    """單一 Excel：4 張運算工作表 + 2 張姓名對照；姓名對照不進入排班核心。"""
+    names = {
+        '員工資料': ['員工資料', '員工資料_去識別化', 'Caregiver_Profiles'],
+        '個案資料': ['個案資料', '個案資料_去識別化', 'Client_Profiles'],
+        '週服務計畫': ['週服務計畫', '周服務計畫', 'Weekly_Service_Plan'],
+    }
+    with pd.ExcelFile(workbook_file) as xl:
+        selected = {}
+        for role, candidates in names.items():
+            matches = [name for name in candidates if name in xl.sheet_names]
+            if len(matches) != 1:
+                raise ValueError(f'請保留一張「{role}」工作表；目前找不到或有多張同類工作表')
+            selected[role] = pd.read_excel(xl, sheet_name=matches[0], dtype=object)
+        master_names = [n for n in xl.sheet_names if n.lower() == 'service_code']
+        if len(master_names)>1: raise ValueError('Service_code 工作表重複，請只保留一張')
+        master = pd.read_excel(xl, sheet_name=master_names[0], dtype=object) if master_names else None
+        if master is not None:
+            master = master.loc[:,~master.columns.astype(str).str.startswith('Unnamed:')].copy()
+            master = master.dropna(subset=['系統代碼'])
+            master['系統代碼']=master['系統代碼'].astype(str).str.strip().str.upper()
+            if '必要證照' not in master: master['必要證照']=master['系統代碼'].map(DEFAULT_CODE_CERTS).fillna('')
+    result = load_agency_data(selected['員工資料'], selected['個案資料'], selected['週服務計畫'],
+                            start_date, end_date, **kwargs)
+    if master is not None:
+        result['Service_Code'] = master
+        known=set(master['系統代碼'])
+        used={code for _,row in result['Tasks'].iterrows() for code,units in iter_service_codes(row) if units>0}
+        missing=sorted(used-known)
+        if missing:
+            notes=pd.DataFrame([{'資料表':'Service_code','來源列':None,'問題':'主檔缺少 '+code+'；主檔模式需補分鐘，不猜測或以其他碼替代'} for code in missing])
+            result['Import_Issues']=pd.concat([result['Import_Issues'],notes],ignore_index=True)
+    return result
+
+
+def validate_dispatch_inputs(tasks, caregivers):
+    for title,frame,key in [('任務',tasks,'任務ID'),('員工',caregivers,'居服員ID')]:
+        if key not in frame or frame[key].isna().any() or frame[key].astype(str).str.strip().eq('').any() or frame[key].duplicated().any():
+            raise ValueError(title+' ID 空白或重複，請修正後排班')
+    for _,task in tasks.iterrows():
+        begin,end=_hhmm(task.get('時間窗_開始')),_hhmm(task.get('時間窗_結束'))
+        if begin is None or end is None or end<=begin:
+            raise ValueError('任務起迄時間無效，請使用 HH:MM 且結束晚於開始')
+        if not np.isfinite(_number(task.get('服務歷時(分鐘)'))) or _number(task.get('服務歷時(分鐘)'))<=0:
+            raise ValueError('任務服務分鐘必須為有效正數')
+        if task.get('資料來源')=='機構三檔':
+            span=(datetime.strptime(end,'%H:%M')-datetime.strptime(begin,'%H:%M')).total_seconds()/60
+            if span != _number(task.get('服務歷時(分鐘)')):
+                raise ValueError('服務分鐘與起迄時間不符，請同步修正後排班')
+
 
 
 def _get_task_field(row, base_col_name: str):
@@ -194,6 +533,20 @@ def apply_service_duration(
     """依 Service_Code Master 的分鐘數，重算每筆任務服務歷時。"""
 
     result = tasks_df.copy()
+    if '服務歷時來源' in result:
+        supplied = result['服務歷時來源'].fillna('').astype(str).str.startswith(('機構', '人工確認'))
+        if '使用Service_code重算' in result:
+            supplied &= ~result['使用Service_code重算'].fillna(False).astype(bool)
+        if supplied.any():
+            if supplied.all():
+                minutes = pd.to_numeric(result['服務歷時(分鐘)'], errors='coerce')
+                if minutes.isna().any() or minutes.le(0).any():
+                    raise ValueError('機構或人工確認服務分鐘必須為正數')
+                result['服務歷時計算明細'] = result['服務歷時來源']
+                return result
+            other = apply_service_duration(result.loc[~supplied].drop(columns='服務歷時來源'), service_code_df)
+            own = apply_service_duration(result.loc[supplied], service_code_df)
+            return pd.concat([own, other]).sort_index()
 
     required_columns = [
         "系統代碼",
@@ -215,7 +568,7 @@ def apply_service_duration(
     master = service_code_df.copy()
     master = master.dropna(subset=["系統代碼"])
     master["系統代碼"] = (
-        master["系統代碼"].astype(str).str.strip()
+        master["系統代碼"].astype(str).str.strip().str.upper()
     )
 
     duplicated_codes = master[
@@ -231,21 +584,21 @@ def apply_service_duration(
     master = master.set_index("系統代碼")
 
     calculated_minutes = []
+    required_certificates = []
     calculation_details = []
 
     for _, row in result.iterrows():
         task_id = row.get("任務ID", "未知任務")
         total_minutes = 0.0
         details = []
+        certificates = set()
 
-        for index in (1, 2):
-            code_raw = row.get(f"Service_Code_{index}")
-            units_raw = row.get(f"Units_{index}")
+        for code_raw, units_raw in iter_service_codes(row):
 
             if pd.isna(code_raw) or str(code_raw).strip() == "":
                 continue
 
-            code = str(code_raw).strip()
+            code = str(code_raw).strip().upper()
 
             if pd.isna(units_raw):
                 raise ValueError(
@@ -274,6 +627,11 @@ def apply_service_duration(
                 )
 
             master_row = master.loc[code]
+            configured = _text(master_row.get('必要證照'))
+            if configured:
+                certificates.update(x.strip() for x in configured.split('、') if x.strip())
+            elif code in DEFAULT_CODE_CERTS:
+                certificates.add(DEFAULT_CODE_CERTS[code])
             status = str(
                 master_row["是否納入CareFlow"]
             ).strip()
@@ -296,6 +654,8 @@ def apply_service_duration(
                     "尚未設定CareFlow排班分鐘"
                 )
 
+            if not np.isfinite(float(minutes)) or float(minutes) <= 0:
+                raise ValueError(f'{code} 的排班分鐘必須是有效正數')
             subtotal = float(minutes) * units
             total_minutes += subtotal
             details.append(
@@ -307,6 +667,7 @@ def apply_service_duration(
                 f"任務 {task_id} 無法計算出有效服務歷時"
             )
 
+        required_certificates.append("、".join(sorted(certificates)))
         calculated_minutes.append(total_minutes)
         calculation_details.append(" + ".join(details))
 
@@ -316,7 +677,16 @@ def apply_service_duration(
 
     result["服務歷時(分鐘)"] = calculated_minutes
     result["服務歷時計算明細"] = calculation_details
-
+    result['服務碼必要證照'] = required_certificates
+    result['服務歷時來源'] = 'Service_code最新分鐘×Units'
+    if '使用Service_code重算' in result:
+        for idx,row in result.iterrows():
+            if not bool(row.get('使用Service_code重算')): continue
+            begin=pd.Timestamp('2000-01-01 '+str(row['時間窗_開始']))
+            finish=begin+pd.Timedelta(minutes=float(row['服務歷時(分鐘)']))
+            if finish.date()!=begin.date(): raise ValueError('服務時間跨午夜，請拆分任務')
+            result.at[idx,'原計畫結束時間']=row.get('原計畫結束時間',row['時間窗_結束'])
+            result.at[idx,'時間窗_結束']=finish.strftime('%H:%M')
     return result
 # ==========================================
 # 申報法規防呆：BA 服務代碼併報合規檢核
@@ -330,31 +700,26 @@ def check_ba_code_compatibility(task_row) -> Optional[str]:
     本函式僅檢核並回報，不會自動剔除或修改任務——是否略過警告並放行進入排程，
     由呼叫端（例如居督於 app.py 的人工複核介面）決定。
     """
-    code1_raw = _get_task_field(task_row, "Service_Code_1")
-    code2_raw = _get_task_field(task_row, "Service_Code_2")
-    code1 = str(code1_raw).strip() if code1_raw is not None else ""
-    code2 = str(code2_raw).strip() if code2_raw is not None else ""
-    codes = {c for c in (code1, code2) if c}
+    codes = {code for code, _ in iter_service_codes(task_row)}
 
     if "BA01" in codes and ("BA07" in codes or "BA23" in codes):
-        return "違規：BA01（基本身體清潔）不可與 BA07/BA23（沐浴/洗頭）同時段併申報"
+        return "既有規則提示（需人工複核）：BA01（基本身體清潔）不可與 BA07/BA23（沐浴/洗頭）同時段併申報"
 
     if "BA02" in codes and len(codes) > 1:
         other_codes = codes - {"BA02"}
         if not other_codes.issubset({"BA22"}):
-            return f"違規：BA02（基本日常照顧）除 BA22 外不得與其他項目 ({other_codes}) 評定併用"
+            return f"既有規則提示（需人工複核）：BA02（基本日常照顧）除 BA22 外不得與其他項目 ({other_codes}) 評定併用"
 
     if "BA01" in codes and "BA24" in codes:
         return "注意：BA01 與 BA24 同時段申報可能涉及排泄項目重複，請確認計畫書核定內容"
 
     return None
 
-
 def validate_ba_codes(tasks_df: pd.DataFrame) -> pd.DataFrame:
     """對整批任務套用 check_ba_code_compatibility，回傳新增檢核欄位的副本。
 
     新增「BA代碼檢核異常」（違規說明文字或 None）與「含違規代碼」（布林值）兩欄，
-    供派單前的法規防呆健檢（例如上傳資料後的即時檢核儀表板）使用；不修改傳入的
+    供派單前的法規防呆健檢（例如上傳資料後的即時檢核儀錶板）使用；不修改傳入的
     DataFrame，亦不會排除任何任務列。
     """
     result = tasks_df.copy()
@@ -363,60 +728,61 @@ def validate_ba_codes(tasks_df: pd.DataFrame) -> pd.DataFrame:
     result["含違規代碼"] = [m is not None for m in messages]
     return result
 
-
 # ==========================================
 # 財務試算：長照申報點數（營收）與居服員拆帳薪資
 # ==========================================
+def service_price_map(master: pd.DataFrame) -> dict:
+    """只讀機構主檔單價；未知、負值、非數字或重複碼不猜測。"""
+    if not {'系統代碼', '目前給付價格(元)'}.issubset(master.columns):
+        return {}
+    frame = master[['系統代碼', '目前給付價格(元)']].copy()
+    frame['系統代碼'] = frame['系統代碼'].astype(str).str.strip().str.upper()
+    duplicate = set(frame.loc[frame['系統代碼'].duplicated(False), '系統代碼'])
+    prices = {}
+    for code, raw in frame.itertuples(index=False, name=None):
+        price = _number(str(raw).replace(',', '').strip())
+        if code and code not in duplicate and np.isfinite(price) and price >= 0:
+            prices[code] = price
+    return prices
+
+
 def calculate_task_revenue_and_salary(tasks_df: pd.DataFrame, config: "PipelineConfig") -> pd.DataFrame:
-    """試算每筆任務的長照申報點數（機構營收）與居服員拆帳薪資。
-
-    優先以 Service_Code_1/2 對照 BA_UNIT_POINTS 點數表 × Units_1/2 計算；若任務
-    缺乏服務代碼欄位（例如尚未升級至含 BA 碼申報欄位的資料表），退回以服務歷時
-    概算點數，確保任何資料版本皆能得到合理的營收估計。回傳新增兩欄位的副本，
-    不修改傳入的 DataFrame。
-    """
+    """單價×次數加總，再乘拆帳比例。機構資料僅採最新 Service_code 單價。"""
     result = tasks_df.copy()
-    revenues = []
+    revenues, statuses = [], []
     for _, row in result.iterrows():
-        rev = 0.0
-        for code_col, units_col in (("Service_Code_1", "Units_1"), ("Service_Code_2", "Units_2")):
-            code_raw = _get_task_field(row, code_col)
-            units_raw = _get_task_field(row, units_col)
-            code = str(code_raw).strip() if code_raw is not None else ""
-            units = float(units_raw) if units_raw is not None else 0.0
-            if code in BA_UNIT_POINTS:
-                rev += BA_UNIT_POINTS[code] * units
-
-        if rev == 0.0:
-            duration_raw = row.get("服務歷時(分鐘)")
-            duration_mins = float(duration_raw) if pd.notna(duration_raw) else 90.0
-            rev = (duration_mins / 30.0) * _FALLBACK_POINTS_PER_30MIN
-
-        revenues.append(rev)
-
-    result["預估長照申報點數(營收)"] = [round(r, 1) for r in revenues]
-    result["預估居服員拆帳薪資"] = [round(r * config.caregiver_salary_rate_per_point, 1) for r in revenues]
+        prices = config.service_unit_prices
+        if row.get('資料來源') != '機構三檔' and not prices:
+            prices = BA_UNIT_POINTS  # 保留原模型相容性
+        items = list(iter_service_codes(row))
+        missing = sorted({code for code, units in items if code not in prices})
+        invalid = any(not np.isfinite(units) or units < 0 for _, units in items)
+        if not items or missing or invalid:
+            revenues.append(np.nan)
+            statuses.append('缺少單價：' + '、'.join(missing) if missing else '服務碼或次數無效')
+        else:
+            revenues.append(round(sum(prices[code] * units for code, units in items), 2))
+            statuses.append('Service_code單價×次數試算')
+    result['預估長照申報點數(營收)'] = revenues
+    result['預估居服員拆帳薪資'] = (result['預估長照申報點數(營收)'] * config.caregiver_salary_rate_per_point).round(2)
+    result['財務估算狀態'] = statuses
     return result
-
 
 # ==========================================
 # 共用工具
 # ==========================================
 def calc_distance_km(lat1, lon1, lat2, lon2):
-    """以台灣緯度估算直線距離 km（1度緯度約111km，1度經度約101km）。"""
+    """以臺灣緯度估算直線距離 km（1度緯度約111km，1度經度約101km）。"""
     dlat = (lat1 - lat2) * 111.0
     dlon = (lon1 - lon2) * 101.0
     return np.sqrt(dlat**2 + dlon**2)
-
 
 # 字典快取已查詢過的經緯度對 -> 路網時間(分鐘)，Phase 1 / Phase 2 共用同一份快取，
 # 避免同一對座標於不同階段重複發送 API 請求。
 _OSRM_TRAVEL_TIME_CACHE: dict = {}
 
-
 def _round_coord(v: float) -> float:
     return round(float(v), 6)
-
 
 def _osrm_fallback_minutes(lat1, lon1, lat2, lon2, travel_min_per_km, reason) -> float:
     """降級為 Haversine/歐式距離估算，並印出 Warning Log。"""
@@ -426,103 +792,138 @@ def _osrm_fallback_minutes(lat1, lon1, lat2, lon2, travel_min_per_km, reason) ->
     )
     return calc_distance_km(lat1, lon1, lat2, lon2) * travel_min_per_km
 
+def _osrm_endpoint(transport_mode='機車'):
+    def setting(key, default):
+        try:
+            value = st.session_state.get(key)
+        except Exception:
+            value = None
+        return str(value or os.getenv(key) or default).rstrip('/')
+    if transport_mode == '機車':
+        return setting('CAREFLOW_OSRM_MOTORCYCLE_HOST', 'http://127.0.0.1:5001'), 'motorcycle'
+    raise ValueError('OSRM 機車路網僅支援機車；公車／捷運請使用 Google Routes。本版不提供其他交通方式。')
 
-def get_osrm_travel_time(lat1, lon1, lat2, lon2, travel_min_per_km=3.0):
-    """查詢 OSRM 公用路網 API，回傳兩點間真實路網騎乘時間（分鐘）。
 
-    以字典快取已查詢過的經緯度對，避免重複發送 API 請求（大量座標對可先呼叫
-    `prefetch_osrm_travel_times` 以單次 /table 批次請求暖身快取）。若 API 逾時、
-    網路斷線或回傳失敗，自動降級為 calc_distance_km 的概算距離公式，並印出
-    Warning Log，確保 Phase 1 / Phase 2 的排程運算不因外部服務中斷而失敗。
-    """
+def _osrm_cache_key(lat1, lon1, lat2, lon2, mode):
+    host, profile = _osrm_endpoint(mode)
+    return (host, profile, mode, _round_coord(lat1), _round_coord(lon1), _round_coord(lat2), _round_coord(lon2))
+
+
+def get_osrm_travel_time(lat1, lon1, lat2, lon2, travel_min_per_km=3.0, transport_mode='機車'):
+    """查詢對應交通方式的路網；失敗時明確停止，不拿汽車或直線冒充機車。"""
+    host, profile = _osrm_endpoint(transport_mode)
+    if not all(np.isfinite(_number(v)) for v in (lat1,lon1,lat2,lon2)):
+        raise ValueError('缺有效座標，無法估算交通')
     if lat1 == lat2 and lon1 == lon2:
         return 0.0
-
-    key = (_round_coord(lat1), _round_coord(lon1), _round_coord(lat2), _round_coord(lon2))
+    key = _osrm_cache_key(lat1, lon1, lat2, lon2, transport_mode)
     if key in _OSRM_TRAVEL_TIME_CACHE:
         return _OSRM_TRAVEL_TIME_CACHE[key]
-
-    url = f"{OSRM_HOST}/route/v1/{OSRM_PROFILE}/{lon1},{lat1};{lon2},{lat2}"
     try:
-        resp = requests.get(url, params={"overview": "false"}, timeout=OSRM_TIMEOUT_SECONDS)
+        resp = requests.get(f'{host}/route/v1/{profile}/{lon1},{lat1};{lon2},{lat2}', params={'overview':'false'}, timeout=OSRM_TIMEOUT_SECONDS)
         resp.raise_for_status()
         data = resp.json()
-        if data.get("code") != "Ok" or not data.get("routes"):
-            raise ValueError(f"OSRM 回傳異常狀態: {data.get('code')}")
-        travel_min = data["routes"][0]["duration"] / 60.0
+        if data.get('code') != 'Ok' or not data.get('routes'):
+            raise ValueError('無可用路線：' + str(data.get('code')))
+        minutes = float(data['routes'][0]['duration']) / 60.0
+        if not np.isfinite(minutes) or minutes < 0:
+            raise ValueError('回傳無效時間')
     except Exception as exc:
-        travel_min = _osrm_fallback_minutes(lat1, lon1, lat2, lon2, travel_min_per_km, exc)
-
-    _OSRM_TRAVEL_TIME_CACHE[key] = travel_min
-    return travel_min
+        raise RuntimeError(f'OSRM {transport_mode}路網查詢失敗。機車需先依 OSRM_機車啟動說明 建置服務；未使用汽車或直線替代。原因：{exc}') from exc
+    _OSRM_TRAVEL_TIME_CACHE[key] = minutes
+    return minutes
 
 def _get_google_maps_api_key():
-    """
-    優先讀取環境變數，其次讀取 Streamlit secrets。
-    只檢查一次，避免每組交通配對都重複讀取。
-    """
-    global _GOOGLE_API_KEY_CACHE
-    global _GOOGLE_API_KEY_CHECKED
-
-    if _GOOGLE_API_KEY_CHECKED:
-        return _GOOGLE_API_KEY_CACHE
-
-    _GOOGLE_API_KEY_CHECKED = True
-
-    api_key = os.getenv("GOOGLE_MAPS_API_KEY")
-
-    if not api_key:
+    """沿用環境變數或 Streamlit secrets，金鑰不寫入日誌、結果或壓縮包。"""
+    key = os.getenv('GOOGLE_MAPS_API_KEY')
+    if not key:
         try:
-            import streamlit as st
-            api_key = st.secrets.get("GOOGLE_MAPS_API_KEY")
+            key = st.secrets.get('GOOGLE_MAPS_API_KEY')
         except Exception:
-            api_key = None
-
-    _GOOGLE_API_KEY_CACHE = api_key
-    return _GOOGLE_API_KEY_CACHE
+            key = None
+    return str(key).strip() if key else None
 
 
-_GOOGLE_TRAVEL_TIME_CACHE = {}
-_GOOGLE_API_KEY_CACHE = None
-_GOOGLE_API_KEY_CHECKED = False
-_GOOGLE_API_MISSING_WARNED = False
+def google_key_is_configured():
+    return bool(_get_google_maps_api_key())
+
+
+def begin_travel_query_run(max_queries=2000):
+    # 僅當次計算共用，沒有磁碟路線資料庫，也不跨使用者／排班批次共用。
+    _GOOGLE_QUERY_STATE.set({'count': 0, 'limit': int(max_queries), 'memo': {}})
+
+
+def _google_query_state():
+    state = _GOOGLE_QUERY_STATE.get()
+    if state is None:
+        begin_travel_query_run()
+        state = _GOOGLE_QUERY_STATE.get()
+    return state
+
+
+def _google_timestamp(value):
+    if value is None:
+        return None
+    ts = pd.Timestamp(value)
+    if pd.isna(ts):
+        return None
+    if ts.tzinfo is None:
+        ts = ts.tz_localize('Asia/Taipei')
+    return ts.isoformat()
+
+
+def _task_clock(task, clock):
+    day = task.get('日期') if hasattr(task, 'get') else task
+    if day is None or pd.isna(day) or str(day) in ('', '單日'):
+        day = pd.Timestamp.now(tz='Asia/Taipei').date()
+    return pd.Timestamp(str(pd.Timestamp(day).date()) + ' ' + pd.Timestamp(clock).strftime('%H:%M:%S'))
+
+
+def _task_arrival(task):
+    return _task_clock(task, pd.Timestamp('2000-01-01 ' + str(task['時間窗_開始'])))
+
+
+def _travel_source(mode):
+    provider = _get_travel_provider()
+    if not _GOOGLE_ALLOWED.get() and (provider == 'google' or (provider == 'hybrid' and mode == '大眾運輸')):
+        return '本機距離概算（尚未 Google 核對）'
+    if provider == 'hybrid':
+        return 'OSRM 機車路網' if mode == '機車' else 'Google Maps（公車／捷運）'
+    return {'osrm':'OSRM 機車路網', 'google':'Google Maps', 'local':'本機距離概算'}[provider]
 
 
 def _get_travel_provider():
     """
     交通時間來源：
-    1. 優先讀環境變數 CAREFLOW_TRAVEL_PROVIDER
-    2. 其次讀 Streamlit secrets
-    3. 若都未設定，預設使用 OSRM
+    1. 優先讀頁面交通選擇
+    2. 其次讀環境變數或 Streamlit secrets
+    3. 引擎未設定時使用本機概算，頁面預設混合模式
     """
-    provider = os.getenv("CAREFLOW_TRAVEL_PROVIDER")
+    try:
+        selected = st.session_state.get('careflow_travel_provider')
+    except Exception:
+        selected = None
+    provider = selected or os.getenv("CAREFLOW_TRAVEL_PROVIDER")
 
     if not provider:
         try:
             provider = st.secrets.get(
                 "CAREFLOW_TRAVEL_PROVIDER",
-                "osrm",
+                "local",
             )
         except Exception:
-            provider = "osrm"
+            provider = "local"
 
     provider = str(provider).strip().lower()
 
-    if provider not in ("google", "osrm"):
-        provider = "osrm"
+    if provider not in ("google", "osrm", "hybrid", "local"):
+        provider = "local"
 
     return provider
 
-
 def _use_google_routes():
-    """
-    只有明確指定 Google 且 API Key 存在時，
-    才啟用 Google Routes；否則使用 OSRM。
-    """
-    return (
-        _get_travel_provider() == "google"
-        and bool(_get_google_maps_api_key())
-    )
+    # Google 僅處理大眾運輸；機車固定 OSRM，因此始終保留 OSRM 批次暖身。
+    return False
 
 def _parse_google_duration(duration_str):
     """
@@ -535,264 +936,122 @@ def _parse_google_duration(duration_str):
     seconds = float(str(duration_str).rstrip("s"))
     return seconds / 60.0
 
-
-def get_google_travel_time(
-    lat1,
-    lon1,
-    lat2,
-    lon2,
-    transport_mode,
-    travel_min_per_km=3.0,
-):
-    """
-    使用 Google Routes API 計算兩點交通時間。
-
-    transport_mode:
-        機車       -> TWO_WHEELER
-        大眾運輸   -> TRANSIT
-    """
-
+def get_google_travel_time(lat1, lon1, lat2, lon2, transport_mode,
+                           travel_min_per_km=3.0, departure_time=None, arrival_time=None):
+    """依交通來源分流；公車／捷運只用 Google TRANSIT，不退回機車或直線。"""
+    if transport_mode not in ('機車','大眾運輸'):
+        raise ValueError('交通工具僅支援機車或公車／捷運，請修正員工資料。')
+    if not all(np.isfinite(_number(v)) for v in (lat1,lon1,lat2,lon2)):
+        raise ValueError('缺有效座標，無法估算交通')
     if lat1 == lat2 and lon1 == lon2:
         return 0.0
+    provider = _get_travel_provider()
 
-    google_mode = GOOGLE_TRAVEL_MODE_MAP.get(transport_mode)
-
-    if google_mode is None:
-        raise ValueError(
-            f"不支援的常用交通工具：{transport_mode}"
+    # 機車永遠使用自架 OSRM，不允許落入 Google Routes。
+    if transport_mode == '機車':
+        return get_osrm_travel_time(
+            lat1, lon1, lat2, lon2,
+            travel_min_per_km,
+            transport_mode='機車',
         )
 
-    key = (
-        _round_coord(lat1),
-        _round_coord(lon1),
-        _round_coord(lat2),
-        _round_coord(lon2),
-        google_mode,
-    )
-
-    if _use_google_routes() and key in _GOOGLE_TRAVEL_TIME_CACHE:
-        return _GOOGLE_TRAVEL_TIME_CACHE[key]
-
-    api_key = _get_google_maps_api_key() if _use_google_routes() else None
-
-    global _GOOGLE_TEST_CALL_COUNT
-
-    if api_key:
-        if _GOOGLE_TEST_CALL_COUNT >= GOOGLE_TEST_MAX_CALLS:
-            # 測試安全模式：Google 新查詢達上限後，不再呼叫外部路網 API。
-            # 已查過的 Google 路線會由前面的 cache 直接回傳；
-            # 尚未查過的路線改用本地直線距離概算，避免大量 OSRM timeout。
-            travel_min = (
-                calc_distance_km(lat1, lon1, lat2, lon2)
-                * travel_min_per_km
-            )
-            _GOOGLE_TRAVEL_TIME_CACHE[key] = travel_min
-            print(
-                "[Google Routes Safety] 已達本次 Google 測試上限，"
-                f"未查過路線改用本地概算｜交通方式：{transport_mode}"
-            )
-            return travel_min
-
-        _GOOGLE_TEST_CALL_COUNT += 1
-        print(
-            f"[Google Routes Test] 第 {_GOOGLE_TEST_CALL_COUNT}/"
-            f"{GOOGLE_TEST_MAX_CALLS} 次 Google 查詢"
-            f"｜交通方式：{transport_mode}"
-        )
-    # 預設使用 OSRM；選擇 Google 但未設定金鑰時也退回 OSRM。
+    if provider == 'local':
+        return calc_distance_km(lat1,lon1,lat2,lon2) * 5.0 + 10.0
+    if provider == 'osrm':
+        raise ValueError('OSRM 僅提供機車路網；公車／捷運請使用 Google Routes。')
+    if not _GOOGLE_ALLOWED.get():
+        factor = 5.0 if transport_mode == '大眾運輸' else travel_min_per_km
+        return calc_distance_km(lat1,lon1,lat2,lon2) * factor + (10.0 if transport_mode == '大眾運輸' else 0.0)
+    api_key = _get_google_maps_api_key()
     if not api_key:
-        global _GOOGLE_API_MISSING_WARNED
-
-        if (
-            _get_travel_provider() == "google"
-            and not _GOOGLE_API_MISSING_WARNED
-        ):
-            print(
-                "[Google Routes Warning] 已選擇 Google Routes，"
-                "但尚未設定 GOOGLE_MAPS_API_KEY，"
-                "本次排班改用 OSRM 交通時間。"
-            )
-            _GOOGLE_API_MISSING_WARNED = True
-
-
-        travel_min = get_osrm_travel_time(
-            lat1,
-            lon1,
-            lat2,
-            lon2,
-            travel_min_per_km,
-        )
-
-        return travel_min
-
-    headers = {
-        "Content-Type": "application/json",
-        "X-Goog-Api-Key": api_key,
-        "X-Goog-FieldMask": (
-            "originIndex,destinationIndex,"
-            "status,condition,duration,distanceMeters"
-        ),
-    }
-
-
-
-    body = {
-        "origins": [
-            {
-                "waypoint": {
-                    "location": {
-                        "latLng": {
-                            "latitude": float(lat1),
-                            "longitude": float(lon1),
-                        }
-                    }
-                }
-            }
-        ],
-        "destinations": [
-            {
-                "waypoint": {
-                    "location": {
-                        "latLng": {
-                            "latitude": float(lat2),
-                            "longitude": float(lon2),
-                        }
-                    }
-                }
-            }
-        ],
-        "travelMode": google_mode,
-        "languageCode": "zh-TW",
-        "regionCode": "TW",
-    }
-
-    # routingPreference 只能用於 DRIVE / TWO_WHEELER，
-    # TRANSIT 不可帶這個欄位。
-    if google_mode == "TWO_WHEELER":
-        body["routingPreference"] = "TRAFFIC_AWARE"
-
+        raise RuntimeError('公車／捷運需 Google Routes：請在專案 .streamlit/secrets.toml 設定 GOOGLE_MAPS_API_KEY，並啟用 Routes API 與帳務。未改用機車或直線。')
+    if departure_time is not None and arrival_time is not None:
+        raise ValueError('交通查詢只能指定出發或抵達時間其中一個')
+    # 能走到這裡的只會是大眾運輸，因此 Google 僅使用 TRANSIT。
+    google_mode = GOOGLE_TRAVEL_MODE_MAP["大眾運輸"]
+    departure = _google_timestamp(departure_time)
+    arrival = _google_timestamp(arrival_time) if google_mode == 'TRANSIT' else None
+    if google_mode == 'TRANSIT' and not departure and not arrival:
+        departure = _google_timestamp(pd.Timestamp.now(tz='Asia/Taipei').floor('min'))
+    key = (_round_coord(lat1),_round_coord(lon1),_round_coord(lat2),_round_coord(lon2),google_mode,departure,arrival)
+    collecting = _GOOGLE_COLLECT.get()
+    if collecting is not None:
+        collecting.add(key)
+        return 0.0
+    state = _google_query_state()
+    if key in state['memo']:
+        return state['memo'][key]
+    if state['count'] >= state['limit']:
+        raise RuntimeError(f"已達當次 Google 查詢上限 {state['limit']} 筆，請縮小排班日期或在交通進階設定提高上限。未改用直線概算。")
+    def waypoint(lat,lon):
+        return {'waypoint': {'location': {'latLng': {'latitude': float(lat), 'longitude': float(lon)}}}}
+    body = {'origins':[waypoint(lat1,lon1)],'destinations':[waypoint(lat2,lon2)],
+            'travelMode':google_mode,'languageCode':'zh-TW','regionCode':'TW'}
+    if departure:
+        body['departureTime'] = departure
+    if arrival:
+        body['arrivalTime'] = arrival
+    # 個資保護：送出前以白名單檢查 payload；姓名／電話／地址等不允許出現在請求。
+    _validate_google_routes_payload(body)
+    headers = {'Content-Type':'application/json','X-Goog-Api-Key':api_key,
+               'X-Goog-FieldMask':'originIndex,destinationIndex,status,condition,duration,distanceMeters'}
+    state['count'] += 1
     try:
-        response = requests.post(
-            GOOGLE_ROUTES_URL,
-            headers=headers,
-            json=body,
-            timeout=GOOGLE_ROUTES_TIMEOUT_SECONDS,
-        )
-        # 測試用：Google 若回傳錯誤，把真正原因印出來
+        response = requests.post(GOOGLE_ROUTES_URL,headers=headers,json=body,timeout=GOOGLE_ROUTES_TIMEOUT_SECONDS)
         if not response.ok:
-            print(
-                "[Google Routes Error Body]",
-                response.status_code,
-                response.text,
-            )
-
-        response.raise_for_status()
-
+            status = response.status_code
+            raise RuntimeError(f'HTTP {status}；請檢查金鑰、Routes API、帳務與配額')
         data = response.json()
-
-        if not data:
-            raise ValueError("Google Routes API 未回傳路徑")
-
+        if not isinstance(data,list) or not data:
+            raise ValueError('未回傳路線')
         element = data[0]
-
-        if element.get("condition") != "ROUTE_EXISTS":
-            raise ValueError(
-                f"Google Routes 無可用路徑："
-                f"{element.get('condition')}"
-            )
-
-        travel_min = _parse_google_duration(
-            element.get("duration")
-        )
-
-        if travel_min is None:
-            raise ValueError("Google Routes 未回傳 duration")
-
+        code = element.get('status',{}).get('code',0)
+        if code or element.get('condition') != 'ROUTE_EXISTS':
+            raise ValueError(f'無可用路線或班次（狀態 {code}）')
+        minutes = _parse_google_duration(element.get('duration'))
+        if minutes is None or not np.isfinite(minutes) or minutes < 0:
+            raise ValueError('未回傳有效交通分鐘')
     except Exception as exc:
+        # 不印出 response body、headers 或憑證；requests 例外亦可能帶請求內容。
+        detail = str(exc) if isinstance(exc,(ValueError,RuntimeError)) else type(exc).__name__
+        raise RuntimeError(f'Google Routes {transport_mode}查詢失敗：{detail}。未改用機車或直線。') from None
+    state['memo'][key] = minutes
+    return minutes
 
-        print(
-            f"[Google Routes Warning] "
-            f"{transport_mode} 路徑查詢失敗：{exc}"
-        )
 
-        # Google 暫時失效時，不讓整個排班系統掛掉
-        travel_min = get_osrm_travel_time(
-            lat1,
-            lon1,
-            lat2,
-            lon2,
-            travel_min_per_km,
-        )
-
-    _GOOGLE_TRAVEL_TIME_CACHE[key] = travel_min
-
-    return travel_min
-
-def _fetch_osrm_table_chunk(origins, destinations, travel_min_per_km):
-    """對一批 origin x destination 座標呼叫 OSRM /table 矩陣 API，一次查詢多組配對的
-    路網時間，寫入共用快取。origins / destinations 皆為已四捨五入的 (lat, lon) tuple 清單。
-    """
+def _fetch_osrm_table_chunk(origins, destinations, travel_min_per_km, transport_mode='機車'):
+    host, profile = _osrm_endpoint(transport_mode)
     coords = origins + destinations
-    coord_str = ";".join(f"{lon},{lat}" for lat, lon in coords)
-    sources = ";".join(str(i) for i in range(len(origins)))
-    dest_indices = ";".join(str(len(origins) + i) for i in range(len(destinations)))
-    url = f"{OSRM_HOST}/table/v1/{OSRM_PROFILE}/{coord_str}"
-
+    coord_str = ';'.join(f'{lon},{lat}' for lat,lon in coords)
     try:
-        resp = requests.get(
-            url,
-            params={"annotations": "duration", "sources": sources, "destinations": dest_indices},
-            timeout=OSRM_TABLE_TIMEOUT_SECONDS,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        if data.get("code") != "Ok":
-            raise ValueError(f"OSRM /table 回傳異常狀態: {data.get('code')}")
-        durations = data["durations"]
+        resp = requests.get(f'{host}/table/v1/{profile}/{coord_str}',
+            params={'annotations':'duration','sources':';'.join(str(i) for i in range(len(origins))),
+                    'destinations':';'.join(str(len(origins)+i) for i in range(len(destinations)))}, timeout=OSRM_TABLE_TIMEOUT_SECONDS)
+        resp.raise_for_status(); data = resp.json()
+        if data.get('code') != 'Ok':
+            raise ValueError('批次查詢失敗：'+str(data.get('code')))
+        durations = data['durations']
     except Exception as exc:
-        print(
-            f"[OSRM Warning] /table 批次路網查詢失敗（{len(origins)}x{len(destinations)} 座標對），"
-            f"個別配對將於逐筆查詢時各自降級為概算公式: {exc}"
-        )
+        raise RuntimeError(f'OSRM {transport_mode}路網尚未啟動或查詢失敗；請依 OSRM_機車啟動說明 建置服務。未改用汽車或直線。原因：{exc}') from exc
+    for i,(lat1,lon1) in enumerate(origins):
+        for j,(lat2,lon2) in enumerate(destinations):
+            duration = durations[i][j]
+            if duration is not None and np.isfinite(float(duration)) and float(duration) >= 0:
+                _OSRM_TRAVEL_TIME_CACHE[_osrm_cache_key(lat1,lon1,lat2,lon2,transport_mode)] = float(duration)/60
+
+
+def prefetch_osrm_travel_times(origins, destinations, travel_min_per_km=3.0, transport_mode='機車'):
+    if _get_travel_provider() not in ('osrm','hybrid') or transport_mode != '機車':
         return
-
-    for i, (o_lat, o_lon) in enumerate(origins):
-        for j, (d_lat, d_lon) in enumerate(destinations):
-            key = (o_lat, o_lon, d_lat, d_lon)
-            duration_sec = durations[i][j]
-            if duration_sec is None:
-                _OSRM_TRAVEL_TIME_CACHE[key] = _osrm_fallback_minutes(
-                    o_lat, o_lon, d_lat, d_lon, travel_min_per_km, "OSRM /table 無法規劃該路徑"
-                )
-            else:
-                _OSRM_TRAVEL_TIME_CACHE[key] = duration_sec / 60.0
-
-
-def prefetch_osrm_travel_times(origins, destinations, travel_min_per_km=3.0) -> None:
-    """批次暖身 OSRM 路網時間快取，大幅降低 Phase 1 / Phase 2 的 API 呼叫次數。
-
-    origins / destinations 為 (lat, lon) 的可迭代物件（例如所有居服員住家座標 x 所有
-    任務地點座標）。以 OSRM `/table` 矩陣 API 一次查詢整批配對，取代逐筆呼叫
-    `get_osrm_travel_time` 各自發送一次 HTTP 請求；查詢結果寫入與 `get_osrm_travel_time`
-    共用的字典快取，之後逐筆呼叫即直接命中快取。任一批次查詢失敗僅印出 Warning Log
-    並跳過，未快取的配對會在後續逐筆查詢時各自降級為概算公式，不影響排程結果正確性。
-    """
-    unique_origins = sorted({(_round_coord(lat), _round_coord(lon)) for lat, lon in origins})
-    unique_destinations = sorted({(_round_coord(lat), _round_coord(lon)) for lat, lon in destinations})
-
-    pending_origins = [
-        o
-        for o in unique_origins
-        if any((o[0], o[1], d[0], d[1]) not in _OSRM_TRAVEL_TIME_CACHE for d in unique_destinations)
-    ]
-    if not pending_origins or not unique_destinations:
-        return
-
-    dest_chunk_size = max(1, OSRM_TABLE_MAX_COORDS - len(pending_origins))
-    for i in range(0, len(unique_destinations), dest_chunk_size):
-        dest_chunk = unique_destinations[i : i + dest_chunk_size]
-        _fetch_osrm_table_chunk(pending_origins, dest_chunk, travel_min_per_km)
-
+    origins = sorted({(_round_coord(lat),_round_coord(lon)) for lat,lon in origins if np.isfinite(_number(lat)) and np.isfinite(_number(lon))})
+    destinations = sorted({(_round_coord(lat),_round_coord(lon)) for lat,lon in destinations if np.isfinite(_number(lat)) and np.isfinite(_number(lon))})
+    # 兩邊都切塊，避免大量起點已超出 table 座標上限。
+    chunk_size = OSRM_TABLE_MAX_COORDS // 2
+    for i in range(0,len(origins),chunk_size):
+        for j in range(0,len(destinations),chunk_size):
+            left,right = origins[i:i+chunk_size],destinations[j:j+chunk_size]
+            if any(_osrm_cache_key(*o,*d,transport_mode) not in _OSRM_TRAVEL_TIME_CACHE for o in left for d in right):
+                _fetch_osrm_table_chunk(left,right,travel_min_per_km,transport_mode)
 
 def calc_travel_minutes(
     lat1,
@@ -801,13 +1060,15 @@ def calc_travel_minutes(
     lon2,
     config: "PipelineConfig",
     transport_mode="機車",
+    departure_time=None,
+    arrival_time=None,
 ) -> float:
     """
     兩點間轉場時間（分鐘，不含轉場緩衝）。
 
-    依居服員「常用交通工具」選擇 Google Routes travel mode：
-    機車 -> TWO_WHEELER
-    大眾運輸 -> TRANSIT
+    依居服員「常用交通工具」分流：
+    機車 -> 自架 OSRM motorcycle
+    大眾運輸 -> Google Routes TRANSIT
     """
 
     return get_google_travel_time(
@@ -817,17 +1078,18 @@ def calc_travel_minutes(
         lon2,
         transport_mode,
         config.travel_min_per_km,
+        departure_time=departure_time, arrival_time=arrival_time,
     )
-
 
 def get_service_intensity_weight(task) -> float:
     """依服務項目之體力耗費強度，回傳該任務對應的疲勞度加權係數。"""
-    if task["需重度移位協助(0/1)"] == 1:
+    if task.get("需重度移位協助(0/1)") == 1:
         return SERVICE_INTENSITY_WEIGHT["重度移位"]
-    if task["特殊照護需求"] in ("餐食照顧/管灌", "管路安全與特殊日常照護"):
+    if task.get("特殊照護需求") in ("餐食照顧/管灌", "管路安全與特殊日常照護"):
         return SERVICE_INTENSITY_WEIGHT["餐食管灌"]
+    if pd.isna(task.get('需重度移位協助(0/1)')) and not _text(task.get('特殊照護需求')):
+        return 1.0  # 中性計畫負荷權重，不代表已確認照護強度
     return SERVICE_INTENSITY_WEIGHT["一般照護"]
-
 
 def parse_time(time_str):
     if pd.isna(time_str) or time_str == "無既定行程":
@@ -837,7 +1099,6 @@ def parse_time(time_str):
         datetime.strptime(parts[0].strip(), "%H:%M"),
         datetime.strptime(parts[1].strip(), "%H:%M"),
     )
-
 
 def _check_hard_constraints(
     task,
@@ -853,7 +1114,7 @@ def _check_hard_constraints(
     星期對應／時間窗涵蓋／請假排除三項檢查，僅在 task／cg 實際具備對應欄位
     （可排班星期、每日可服務時段_起/迄、請假或不排班日期、星期、日期）時才生效
     ——以 `.get()` 取值，取不到（欄位不存在或為空）即直接跳過該檢查，因此舊版
-    僅有「今日既定行程」欄位、不含這些欄位的資料表行為完全不受影響。
+    僅有「今日既定行程」欄位、不含這些欄位的資料錶行為完全不受影響。
     車程上限檢查同理，僅在呼叫端提供 travel_time_min 且 config.max_travel_minutes
     已設定（非 None）時才生效，預設為停用。
     """
@@ -864,17 +1125,45 @@ def _check_hard_constraints(
     # 訊息在描述「獲派居服員」而非「原首選居服員」，見任務一問題分析。
 
     # Excel 的「指定居服員性別」是：男女不拘，但原本辨識：限男性限女性，所以修改如下
-    req_gender = str(task["指定居服員性別"]).strip()
+    if _text(task.get('任務資料異常')):
+        return _text(task.get('任務資料異常'))
+    if '可服務資料已確認' in cg and not _is_periodic_task(cg.get('可服務資料已確認')):
+        return '可服務時段假設尚未採用或請假資料待修正'
+    if not all(np.isfinite(_number(v)) for v in [task.get('服務地點_緯度'),task.get('服務地點_經度'),
+                   cg.get('服務起點_緯度(家)'),cg.get('服務起點_經度(家)')]):
+        return '個案或員工缺有效座標'
+    for latitude,longitude in [(task.get('服務地點_緯度'),task.get('服務地點_經度')),
+                               (cg.get('服務起點_緯度(家)'),cg.get('服務起點_經度(家)'))]:
+        if not (20 <= _number(latitude) <= 27.5 and 118 <= _number(longitude) <= 123.5):
+            return '座標不在預期臺灣範圍，請確認資料'
+    if not np.isfinite(_number(cg.get('每日工時上限(小時)'))) or _number(cg.get('每日工時上限(小時)'))<=0:
+        return '每日工時上限缺漏或無效'
+    day = _date(task.get('日期'))
+    expiry = _date(cg.get('長照服務人員到期日'))
+    if day and expiry and day > expiry:
+        return '長照服務人員證明已到期，需更新資格資料'
+    leave = cg.get('請假紀錄')
+    if day and isinstance(leave,(tuple,list)) and len(leave)==2:
+        task_begin = pd.Timestamp(f"{day.isoformat()} {task['時間窗_開始']}")
+        task_end = pd.Timestamp(f"{day.isoformat()} {task['時間窗_結束']}")
+        if task_begin < pd.Timestamp(leave[1]) and task_end > pd.Timestamp(leave[0]):
+            return '任務時段與請假區間重疊'
+    needed = set(x for x in _text(task.get('服務碼必要證照')).split('、') if x)
+    for code,units in iter_service_codes(task):
+        if units>0 and code.upper() in DEFAULT_CODE_CERTS: needed.add(DEFAULT_CODE_CERTS[code.upper()])
+    qualification_error = special_qualification_error(task,cg,needed)
+    if qualification_error:return qualification_error
+    req_gender = str(task.get("指定居服員性別", "")).strip()
     if req_gender in ("女", "限女性") and cg["性別"] != "女":
         return "案家指定女性居服員，性別不符"
     if req_gender in ("男", "限男性") and cg["性別"] != "男":
         return "案家指定男性居服員，性別不符"
 
-    if task["需重度移位協助(0/1)"] == 1 and cg["具備重度移位體力(0/1)"] == 0:
+    if task.get("需重度移位協助(0/1)") == 1 and cg.get("具備重度移位體力(0/1)") != 1:
         return "案家需重度移位協助，不具備相關體力條件"
 
-    cg_excl = cg["特殊排斥條件"]
-    if cg_excl in EXCLUSION_MAP and task["案家環境特徵"] == EXCLUSION_MAP[cg_excl]:
+    cg_excl = cg.get("特殊排斥條件", "")
+    if cg_excl in EXCLUSION_MAP and task.get("案家環境特徵", "") == EXCLUSION_MAP[cg_excl]:
         return f"排斥「{EXCLUSION_MAP[cg_excl]}」環境條件"
 
     # 星期對應檢查 (Day-of-Week Matching)：僅當「星期」／「可排班星期」欄位確實存在於
@@ -952,12 +1241,11 @@ def _check_hard_constraints(
         if cap is not None and travel_time_min > cap:
             return f"預估車程({travel_time_min:.0f}分)超過上限({cap:.0f}分鐘)"
 
-    required_certs = SPECIAL_CERT_REQUIREMENTS.get(task["特殊照護需求"])
-    if required_certs and cg["核心專長證照"] not in required_certs:
+    required_certs = SPECIAL_CERT_REQUIREMENTS.get(task.get("特殊照護需求"))
+    if required_certs and not any(caregiver_has_cert(cg,c) for c in required_certs):
         return "缺乏該需求類別之法定專長認證"
 
     return None
-
 
 # ==========================================
 # Phase 1: 適配度過濾與評分機制
@@ -967,52 +1255,53 @@ def run_phase1_matching(
     df_cg: pd.DataFrame,
     config: PipelineConfig,
 ) -> pd.DataFrame:
+    validate_dispatch_inputs(tasks, df_cg)
     match_results = []
+    diagnostics = []
 
     # 進入逐筆比對迴圈前，先以單次 OSRM /table 批次查詢暖身快取
     # （居服員住家 x 任務地點），取代 N x M 次個別 HTTP 請求。
     # 只有未啟用 Google Routes 時，才預抓 OSRM 矩陣
     if not _use_google_routes():
-        prefetch_osrm_travel_times(
-            (
-                (cg["服務起點_緯度(家)"], cg["服務起點_經度(家)"])
-                for _, cg in df_cg.iterrows()
-            ),
-            (
-                (task["服務地點_緯度"], task["服務地點_經度"])
-                for _, task in tasks.iterrows()
-            ),
-            config.travel_min_per_km,
-        )
+        for mode, workers in df_cg.groupby('常用交通工具', sort=False):
+            prefetch_osrm_travel_times(
+                workers[['服務起點_緯度(家)','服務起點_經度(家)']].itertuples(index=False,name=None),
+                tasks[['服務地點_緯度','服務地點_經度']].itertuples(index=False,name=None),
+                config.travel_min_per_km, transport_mode=mode)
+    caregiver_rows = list(df_cg.iterrows())
     for _, task in tasks.iterrows():
         t_id = task["任務ID"]
         c_id = task["案家ID"]
         client_lat = task["服務地點_緯度"]
         client_lon = task["服務地點_經度"]
-        pref_cg = task["歷史首選居服員ID"]
-        req_type = task["特殊照護需求"]
+        pref_cg = _text(task.get("歷史首選居服員ID"))
+        req_type = _text(task.get("特殊照護需求"))
 
         matched_count_for_task = 0
         reason_counts: dict = {}
 
-        for _, cg in df_cg.iterrows():
+        for _, cg in caregiver_rows:
             cg_id = cg["居服員ID"]
-            is_preferred = cg_id == pref_cg
+            is_preferred = bool(pref_cg) and cg_id == pref_cg
 
             transport_mode = str(
                 cg.get("常用交通工具", "機車")
             ).strip()
 
-            if transport_mode not in ("機車", "大眾運輸", "汽車"):
-                transport_mode = "機車"
+            if transport_mode not in ("機車", "大眾運輸"):
+                raise ValueError("交通工具僅支援機車或公車／捷運，請修正員工資料。")
 
+            early_reason = _check_hard_constraints(task, cg, config, None, is_preferred)
+            if early_reason:
+                reason_counts[early_reason] = reason_counts.get(early_reason, 0) + 1
+                continue
             travel_time_min = calc_travel_minutes(
                 cg["服務起點_緯度(家)"],
                 cg["服務起點_經度(家)"],
                 client_lat,
                 client_lon,
                 config,
-                transport_mode=transport_mode,
+                transport_mode=transport_mode, arrival_time=_task_arrival(task),
             )
 
             # --- Hard Constraints (硬性過濾，不合格者直接剔除) ---
@@ -1031,18 +1320,16 @@ def run_phase1_matching(
             # 1. 專長匹配
             skill_bonus = 0.0
 
-            if req_type == "失智引導與精神陪伴" and cert in [
-                "失智症照顧專長",
-                "精神疾病照顧專長",
-            ]:
+            if req_type == "失智引導與精神陪伴" and caregiver_has_cert(cg,"失智症照顧專長"):
                 skill_bonus = config.cert_bonus_dementia
 
             elif (
                 req_type in ["管路安全與特殊日常照護", "餐食照顧/管灌"]
-                and cert == "單一級照服證照"
+                and caregiver_has_cert(cg, "單一級照服證照")
             ):
                 skill_bonus = config.cert_bonus_other
 
+            skill_bonus += certificate_bonus(task,cg)
 
             # 2. 照護連續性
             continuity_bonus = 0.0
@@ -1059,13 +1346,10 @@ def run_phase1_matching(
                         config.continuity_performance_bonus
                     )
 
-
             # 3. 歷史服務品質
-            satisfaction_adjustment = (
-                cg["歷史滿意度均值"]
-                - config.satisfaction_baseline
-            ) * config.satisfaction_weight
-
+            satisfaction = _number(cg.get('歷史滿意度均值'))
+            satisfaction_adjustment = ((satisfaction - config.satisfaction_baseline) * config.satisfaction_weight
+                                       if np.isfinite(satisfaction) else 0.0)
 
             # 4. 交通成本
             travel_penalty = min(
@@ -1073,14 +1357,16 @@ def run_phase1_matching(
                 config.travel_penalty_cap
             )
 
-
             # 5. 疲勞 / 工作負荷
             intensity_weight = get_service_intensity_weight(task)
-            weighted_fatigue_hours = cg["當月累計服務時數(疲勞度)"] * intensity_weight
-            fatigue_penalty = (
-                 weighted_fatigue_hours / config.fatigue_reference_hours
-            ) * config.fatigue_weight
-
+            actual_hours = _number(cg.get('當月累計服務時數(疲勞度)'))
+            actual_penalty = (actual_hours * intensity_weight / config.fatigue_reference_hours * config.fatigue_weight
+                              if np.isfinite(actual_hours) else 0.0)
+            planned_hours = _number(cg.get('本次計畫已排時數'),0.0)
+            weighted_hours = _number(cg.get('本次計畫加權負荷時數'),planned_hours)
+            plan_load = weighted_hours if config.plan_load_mode=='weighted' else planned_hours
+            plan_penalty = plan_load / config.fatigue_reference_hours * config.fatigue_weight
+            fatigue_penalty = actual_penalty + plan_penalty
 
             # ==========================================
             # 最終適配度分數
@@ -1094,7 +1380,6 @@ def run_phase1_matching(
                 - travel_penalty
                 - fatigue_penalty
             )
-
 
             # ==========================================
             # 保存結果
@@ -1133,11 +1418,23 @@ def run_phase1_matching(
 
                     "當月累計服務時數": round(
                         float(
-                            cg["當月累計服務時數(疲勞度)"]
+                            actual_hours
                         ),
                         1
                     ),
 
+                    "疲勞資料狀態": '已提供累計工時' if np.isfinite(actual_hours) else '以本次已排工作量分配；未提供實際出勤工時',
+                    "滿意度資料狀態": '已提供' if np.isfinite(satisfaction) else '未提供，不參與評分',
+                    "本次計畫已排時數": round(planned_hours,2),
+                    "本次計畫加權負荷時數": round(weighted_hours,2),
+                    **{k:task.get(k) for k in ["照護難度參考係數","照護難度判斷依據","照護提示","服務碼必要證照"]},
+                    "本次計畫負荷扣分": round(plan_penalty,2),
+                    "實際工時負荷扣分": round(actual_penalty,2) if np.isfinite(actual_hours) else np.nan,
+                    "資料來源": task.get('資料來源','原格式'),
+                    "待確認事項": task.get('任務待確認事項',''),
+                    "交通估算來源": _travel_source(transport_mode),
+                    "失智症資料狀態": "已確認失智" if dementia_status(task) is True else "已確認非失智" if dementia_status(task) is False else "失智狀態未提供，需機構確認",
+                    "特殊資格檢查": "依員工資格文字符合本次服務要求",
                     "服務強度係數": round(
                         float(intensity_weight),
                         2
@@ -1166,23 +1463,21 @@ def run_phase1_matching(
 
                     "具備失智症20小時認證(0/1)":
                         int(
-                            cert == "失智症照顧專長"
+                            caregiver_has_cert(cg, "失智症照顧專長")
                         ),
 
                     "具備精神疾病20小時認證(0/1)":
                         int(
-                            cert == "精神疾病照顧專長"
+                            caregiver_has_cert(cg, "精神疾病照顧專長")
                         ),
 
                     "常用交通工具": transport_mode,
                 }
             )
-        if matched_count_for_task == 0:
-            print(f"[Match Warning] 任務 {t_id} 找不到任何符合條件的居服員，剔除原因分佈：{reason_counts}")
-
-    return pd.DataFrame(match_results)
-
-
+        diagnostics.append({'任務ID':t_id,'候選數':matched_count_for_task,'剔除原因':str(reason_counts)})
+    frame = pd.DataFrame(match_results)
+    frame.attrs['matching_diagnostics'] = diagnostics
+    return frame
 
 def _diagnose_caregiver_change(
     task_row,
@@ -1216,8 +1511,9 @@ def _diagnose_caregiver_change(
         cg_row = cg_rows.iloc[0]
 
         transport_mode = str(cg_row.get("常用交通工具", "機車")).strip()
-        if transport_mode not in ("機車", "大眾運輸", "汽車"):
-            transport_mode = "機車"
+        if transport_mode not in ("機車", "大眾運輸"):
+
+            raise ValueError("交通工具僅支援機車或公車／捷運，請修正員工資料。")
 
         travel_time_min = calc_travel_minutes(
             cg_row["服務起點_緯度(家)"],
@@ -1250,8 +1546,9 @@ def _diagnose_caregiver_change(
     transport_mode = "機車"
     if not cg_rows.empty:
         transport_mode = str(cg_rows.iloc[0].get("常用交通工具", "機車")).strip()
-    if transport_mode not in ("機車", "大眾運輸", "汽車"):
-        transport_mode = "機車"
+    if transport_mode not in ("機車", "大眾運輸"):
+
+        raise ValueError("交通工具僅支援機車或公車／捷運，請修正員工資料。")
 
     t_start, t_end, t_lat, t_lon = task_times[t_id]
     for other_t_id in other_assigned_task_ids:
@@ -1304,7 +1601,7 @@ def _evaluate_reassignment(
     `_check_hard_constraints`（性別限定、重度移位體力、環境排斥、可排班星期、
     每日可服務時段、請假日期、專長認證）評估 new_cg_id 是否符合本任務的硬性
     資格條件，失敗回傳 reason="hard_constraint" 並附上具體原因（例如「當日已有
-    請假或不排班記錄」「缺乏該需求類別之法定專長認證」）——這只影響下拉選單的
+    請假或不排班記錄」「缺乏該需求類別之法定專長認證」）——這隻影響下拉選單的
     排序與標籤（見 rank_candidates_by_availability），刻意不接在
     check_reassignment_conflict 的權威判定路徑上：本系統沒有「強制派單權限」機制，
     居督仍可能因臨時狀況刻意指派不符合建議條件的居服員，故只標記不隱藏、不封鎖。
@@ -1334,33 +1631,26 @@ def _evaluate_reassignment(
 
     # 改派時依該居服員的常用交通工具計算交通時間
     transport_mode = str(cg_row.get("常用交通工具", "機車")).strip()
-    if transport_mode not in ("機車", "大眾運輸", "汽車"):
-        transport_mode = "機車"
+    if transport_mode not in ("機車", "大眾運輸"):
+
+        raise ValueError("交通工具僅支援機車或公車／捷運，請修正員工資料。")
 
     task_locations = task_locations or {}
 
-    if df_cl is not None and not df_cl.empty and "案家ID" in task_row.index:
-        cl_rows = df_cl[df_cl["案家ID"].astype(str) == str(task_row["案家ID"])]
+    merged_task = task_row.copy()
+    if df_cl is not None and not df_cl.empty and '案家ID' in task_row:
+        cl_rows=df_cl[df_cl['案家ID'].astype(str)==str(task_row['案家ID'])]
         if not cl_rows.empty:
-            merged_task = pd.Series({**cl_rows.iloc[0].to_dict(), **task_row.to_dict()})
-            travel_time_min = None
-            t_loc = task_locations.get(task_id)
-            cg_home_lat = cg_row.get("服務起點_緯度(家)")
-            cg_home_lon = cg_row.get("服務起點_經度(家)")
-            if t_loc and pd.notna(cg_home_lat) and pd.notna(cg_home_lon) and all(pd.notna(v) for v in t_loc):
-                travel_time_min = calc_travel_minutes(
-                    cg_home_lat,
-                    cg_home_lon,
-                    t_loc[0],
-                    t_loc[1],
-                    config,
-                    transport_mode=transport_mode,
-                )
-            is_preferred = str(merged_task.get("歷史首選居服員ID", "")) == str(new_cg_id)
-            hard_reason = _check_hard_constraints(merged_task, cg_row, config, travel_time_min, is_preferred)
-            if hard_reason is not None:
-                result.update(reason="hard_constraint", detail=hard_reason)
-                return result
+            merged_task=pd.Series({**cl_rows.iloc[0].to_dict(),**task_row.to_dict()})
+    loc=task_locations.get(task_id)
+    if loc:
+        if pd.isna(merged_task.get('服務地點_緯度')):merged_task['服務地點_緯度']=loc[0]
+        if pd.isna(merged_task.get('服務地點_經度')):merged_task['服務地點_經度']=loc[1]
+    hard_reason=_check_hard_constraints(merged_task,cg_row,config,None,
+                         _text(merged_task.get('歷史首選居服員ID'))==str(new_cg_id))
+    if hard_reason is not None:
+        result.update(reason='hard_constraint',detail=hard_reason)
+        return result
 
     t_start, t_end = parse_time(f"{task_row['時間窗_開始']}-{task_row['時間窗_結束']}")
     if t_start is None:
@@ -1399,16 +1689,9 @@ def _evaluate_reassignment(
             t_loc = task_locations.get(task_id)
             o_loc = task_locations.get(other_t_id)
             if t_loc and o_loc and all(pd.notna(v) for v in (*t_loc, *o_loc)):
-                travel_mins += calc_travel_minutes(
-                    t_loc[0],
-                    t_loc[1],
-                    o_loc[0],
-                    o_loc[1],
-                    config,
-                    transport_mode=transport_mode,
-                )
+                travel_mins = _interval_travel((t_start,t_end,*t_loc),(o_start,o_end,*o_loc),config,transport_mode,task_row)
 
-            if not (
+            if not np.isfinite(travel_mins) or not (
                 t_end + timedelta(minutes=travel_mins) <= o_start
                 or o_end + timedelta(minutes=travel_mins) <= t_start
             ):
@@ -1420,7 +1703,7 @@ def _evaluate_reassignment(
                     detail=(
                         f"與居服員 {new_cg_id} 當日另一任務（{other_t_id}，"
                         f"{other_row['時間窗_開始']}-{other_row['時間窗_結束']}）時間衝突"
-                        f"（含轉場緩衝約 {travel_mins:.0f} 分鐘）"
+                        + (f"（含轉場緩衝約 {travel_mins:.0f} 分鐘）" if np.isfinite(travel_mins) else "（服務時段重疊）")
                     ),
                 )
                 return result
@@ -1440,7 +1723,6 @@ def _evaluate_reassignment(
     result["available"] = True
     return result
 
-
 def check_reassignment_conflict(
     task_id,
     new_cg_id,
@@ -1450,6 +1732,7 @@ def check_reassignment_conflict(
     config: "PipelineConfig",
     task_locations: Optional[dict] = None,
     date_column: str = "日期",
+    df_cl: Optional[pd.DataFrame] = None,
 ) -> Optional[str]:
     """檢查「快速改派」把 task_id 轉給 new_cg_id 是否會造成時間衝突或工時超標。
 
@@ -1465,10 +1748,9 @@ def check_reassignment_conflict(
     回傳 None 表示可安全改派；否則回傳供 UI 顯示的錯誤說明文字。
     """
     result = _evaluate_reassignment(
-        task_id, new_cg_id, df_tasks, df_result_effective, df_cg, config, task_locations, date_column
+        task_id, new_cg_id, df_tasks, df_result_effective, df_cg, config, task_locations, date_column, df_cl
     )
     return None if result["available"] else result["detail"]
-
 
 def rank_candidates_by_availability(
     task_id,
@@ -1506,7 +1788,6 @@ def rank_candidates_by_availability(
     ]
     return sorted(evaluated, key=lambda r: not r["available"])
 
-
 def _build_cg_busy_blocks(df_cg: pd.DataFrame) -> dict:
     """建立居服員今日既定行程時間阻擋塊 (Time Blocks)，回傳 cg_id -> [(start, end, lat, lon), ...]。
 
@@ -1531,7 +1812,6 @@ def _build_cg_busy_blocks(df_cg: pd.DataFrame) -> dict:
                 )
         cg_busy[cg_id] = busy_intervals
     return cg_busy
-
 
 def _build_break_constraints(solver, X: dict, df_valid: pd.DataFrame, cg_busy: dict, task_times: dict, config: "PipelineConfig") -> None:
     """規則1（勞動合規）：居服員累計連續工作達 config.continuous_work_limit_mins 分鐘，
@@ -1603,8 +1883,6 @@ def _build_break_constraints(solver, X: dict, df_valid: pd.DataFrame, cg_busy: d
 
             i = j
 
-
-
 # ==========================================
 # 動態插單 MVP：臨時新增案件直接插入既有班表
 # ==========================================
@@ -1665,19 +1943,20 @@ def find_insertion_candidates(
     if new_end <= new_start:
         raise ValueError("臨時任務結束時間必須晚於開始時間")
 
-    # 動態插單的「工時」採實際排班占用時間，較符合督導直覺：
+    # 動態插單的「工時」採實際排班佔用時間，較符合督導直覺：
     # 08:00-11:00 = 180 分鐘 = 3 小時。
     # Service Code Master 的「服務歷時(分鐘)」仍保留，供服務碼／申報邏輯使用，
     # 不再拿來顯示動態插單後的實際排班工時。
     new_schedule_minutes = (new_end - new_start).total_seconds() / 60.0
 
-    # Phase 1 的每日工時硬限制也應使用實際排班占用時間。
+    # Phase 1 的每日工時硬限制也應使用實際排班佔用時間。
     one_task = pd.DataFrame([task_series.to_dict()])
     one_task.loc[:, "服務歷時(分鐘)"] = new_schedule_minutes
     phase1 = run_phase1_matching(one_task, df_cg, config)
 
     output_columns = [
         "排名", "居服員ID", "可直接插入", "適配度分數",
+        "待接任務時段", "重疊任務與時段",
         "前一任務（結束）", "下一任務（開始）",
         "前段交通時間(分)", "後段交通時間(分)", "插單後排班工時(小時)",
         "擾動成本", "推薦原因", "不可插入原因",
@@ -1699,8 +1978,9 @@ def find_insertion_candidates(
         cg = cg_rows.iloc[0]
 
         transport_mode = str(cg.get("常用交通工具", "機車")).strip()
-        if transport_mode not in ("機車", "大眾運輸", "汽車"):
-            transport_mode = "機車"
+        if transport_mode not in ("機車", "大眾運輸"):
+
+            raise ValueError("交通工具僅支援機車或公車／捷運，請修正員工資料。")
 
         assigned = []
         if current_result is not None and not current_result.empty:
@@ -1747,8 +2027,17 @@ def find_insertion_candidates(
         outgoing = None
         reason = ""
 
+        overlap_details = []
+        for conflict in overlap:
+            overlap_start = max(new_start, conflict['start'])
+            overlap_end = min(new_end, conflict['end'])
+            overlap_mins = (overlap_end - overlap_start).total_seconds() / 60
+            overlap_details.append(
+                f"{conflict['task_id']}（{conflict['start']:%H:%M}–{conflict['end']:%H:%M}），"
+                f"重疊 {overlap_start:%H:%M}–{overlap_end:%H:%M}，共 {overlap_mins:g} 分鐘"
+            )
         if overlap:
-            reason = "與既有任務時段重疊"
+            reason = f"待接任務 {new_start:%H:%M}–{new_end:%H:%M} 與既有任務重疊：" + '；'.join(overlap_details)
         else:
             # 前一案 -> 新案
             if prev_task is not None:
@@ -1756,7 +2045,7 @@ def find_insertion_candidates(
                     incoming = calc_travel_minutes(
                         prev_task["lat"], prev_task["lon"],
                         task_series["服務地點_緯度"], task_series["服務地點_經度"],
-                        config, transport_mode=transport_mode,
+                        config, transport_mode=transport_mode, departure_time=_task_clock(task_series,prev_task['end'] + timedelta(minutes=config.buffer_mins)),
                     )
                     required_gap = incoming + config.buffer_mins
                 else:
@@ -1764,8 +2053,10 @@ def find_insertion_candidates(
                 actual_gap = (new_start - prev_task["end"]).total_seconds() / 60.0
                 if actual_gap < required_gap:
                     reason = (
-                        f"前一任務銜接不足：可用 {actual_gap:.0f} 分，"
-                        f"至少需 {required_gap:.0f} 分（含緩衝）"
+                        f"前一任務 {prev_task['task_id']} 於 {prev_task['end']:%H:%M} 結束，"
+                        f"待接任務 {new_start:%H:%M} 開始；可用 {actual_gap:g} 分，"
+                        f"至少需 {required_gap:.1f} 分（車程 {format(incoming, '.1f') if incoming is not None else '未取得'}＋緩衝 {config.buffer_mins:g}）；"
+                        f"不足 {required_gap-actual_gap:.1f} 分鐘"
                     )
 
             # 新案 -> 下一案
@@ -1774,7 +2065,7 @@ def find_insertion_candidates(
                     outgoing = calc_travel_minutes(
                         task_series["服務地點_緯度"], task_series["服務地點_經度"],
                         next_task["lat"], next_task["lon"],
-                        config, transport_mode=transport_mode,
+                        config, transport_mode=transport_mode, departure_time=_task_clock(task_series,new_end + timedelta(minutes=config.buffer_mins)),
                     )
                     required_gap = outgoing + config.buffer_mins
                 else:
@@ -1782,16 +2073,18 @@ def find_insertion_candidates(
                 actual_gap = (next_task["start"] - new_end).total_seconds() / 60.0
                 if actual_gap < required_gap:
                     reason = (
-                        f"下一任務銜接不足：可用 {actual_gap:.0f} 分，"
-                        f"至少需 {required_gap:.0f} 分（含緩衝）"
+                        f"待接任務 {new_end:%H:%M} 結束，下一任務 {next_task['task_id']} 於 {next_task['start']:%H:%M} 開始；"
+                        f"可用 {actual_gap:g} 分，至少需 {required_gap:.1f} 分"
+                        f"（車程 {format(outgoing, '.1f') if outgoing is not None else '未取得'}＋緩衝 {config.buffer_mins:g}）；不足 {required_gap-actual_gap:.1f} 分鐘"
                     )
 
         existing_minutes = sum(a["duration"] for a in assigned)
         used_hours = float(cg.get("今日已佔用工時(小時)", 0.0) or 0.0)
         after_hours = used_hours + (existing_minutes + new_schedule_minutes) / 60.0
         cap = cg.get("每日工時上限(小時)")
-        if not reason and pd.notna(cap) and after_hours > float(cap):
-            reason = f"插單後當日總工時 {after_hours:.1f} 小時，超過上限 {float(cap):.1f} 小時"
+        if pd.notna(cap) and after_hours > float(cap):
+            cap_reason = f"插單後當日總工時 {after_hours:.1f} 小時，超過上限 {float(cap):.1f} 小時"
+            reason = reason + '；另有：' + cap_reason if reason else cap_reason
 
         available = reason == ""
         if available:
@@ -1815,6 +2108,8 @@ def find_insertion_candidates(
                 "居服員ID": cg_id,
                 "可直接插入": available,
                 "適配度分數": float(match.get("適配度分數", 0)),
+                "待接任務時段": f"{new_start:%H:%M}–{new_end:%H:%M}",
+                "重疊任務與時段": '；'.join(overlap_details) if overlap_details else '無時段重疊',
                 "前一任務（結束）": (
                     f"{prev_task['task_id']}｜{prev_task['end'].strftime('%H:%M')}"
                     if prev_task else "無"
@@ -1852,10 +2147,123 @@ def find_insertion_candidates(
     result_df.insert(0, "排名", range(1, len(result_df) + 1))
     return result_df[output_columns]
 
+def calculate_schedule_travel(result_df, tasks, caregivers, config):
+    """依每位員工、每日有效派單順序計算家→首案→後續案；不含返家。"""
+    result = result_df.copy().reset_index(drop=True)
+    if result.empty:
+        return result
+    task_map = tasks.set_index('任務ID').to_dict('index')
+    caregiver_map = caregivers.set_index('居服員ID').to_dict('index')
+    if '配對起點車程(分)' not in result:
+        result['配對起點車程(分)'] = result.get('預估車程(分)', np.nan)
+    result['預估車程(分)'] = np.nan
+    result['交通起點'] = ''
+    result['交通終點'] = ''
+    result['交通路段'] = ''
+    result['路段緩衝(分)'] = 0.0
+    result['含緩衝交通時間(分)'] = np.nan
+    result['交通計算狀態'] = ''
+    result['交通日期'] = ''
+    groups = {}
+    for index, row in result.iterrows():
+        task = task_map.get(row['任務ID'], {})
+        day = _text(task.get('日期')) or _text(row.get('排班日期')) or '單日'
+        start = pd.to_datetime(_text(task.get('時間窗_開始')), format='%H:%M', errors='coerce')
+        groups.setdefault((row['派單居服員'], day), []).append((start, str(row['任務ID']), index))
+    route_cache = {}
+    for (cg_id, day), entries in groups.items():
+        cg = caregiver_map.get(cg_id, {})
+        mode = _text(cg.get('常用交通工具')) or '機車'
+        previous = (_number(cg.get('服務起點_緯度(家)')), _number(cg.get('服務起點_經度(家)')))
+        origin = '員工家／服務起點'
+        previous_end = None
+        entries.sort(key=lambda entry: (pd.isna(entry[0]), entry[0] if pd.notna(entry[0]) else pd.Timestamp.max, entry[1]))
+        for order, (start, task_id, index) in enumerate(entries):
+            task = task_map.get(result.at[index, '任務ID'], {})
+            destination = (_number(task.get('服務地點_緯度')), _number(task.get('服務地點_經度')))
+            label = f"{_text(task.get('案家ID'))}（{task_id}）"
+            buffer = 0.0 if order == 0 else config.buffer_mins
+            result.loc[index, ['交通起點','交通終點','交通路段','交通日期']] = [origin,label,origin+' → '+label,day]
+            result.at[index,'路段緩衝(分)'] = buffer
+            if pd.isna(start):
+                result.at[index,'交通計算狀態'] = '缺服務開始時間，無法確認順序'
+            elif order > 0 and mode == '大眾運輸' and (previous_end is None or pd.isna(previous_end)):
+                result.at[index,'交通計算狀態'] = '缺前案結束時間，無法查詢公車／捷運班次'
+            elif not all(np.isfinite(value) for value in (*previous, *destination)):
+                result.at[index,'交通計算狀態'] = '缺起點或終點座標，無法計算'
+            else:
+                arrival = _task_clock(task,start) if order == 0 else None
+                departure = _task_clock(task,previous_end + timedelta(minutes=buffer)) if previous_end is not None and pd.notna(previous_end) else None
+                key = (*previous, *destination, mode, str(departure), str(arrival))
+                if key not in route_cache:
+                    route_cache[key] = calc_travel_minutes(*previous, *destination, config, transport_mode=mode, departure_time=departure, arrival_time=arrival)
+                minutes = route_cache[key]
+                result.at[index,'預估車程(分)'] = round(minutes, 2)
+                result.at[index,'含緩衝交通時間(分)'] = round(minutes + buffer, 2)
+                result.at[index,'交通計算狀態'] = '依當日服務順序估算'
+                result.at[index,'交通估算來源'] = _travel_source(mode)
+                result.at[index,'交通查詢時間'] = _google_timestamp(departure or arrival) or ''
+                if order > 0 and previous_end is not None and pd.notna(previous_end):
+                    result.at[index,'轉場時段檢查'] = ('轉場時間不足，需調班' if previous_end + timedelta(minutes=minutes + buffer) > start else '轉場時間足夠')
+                else:
+                    result.at[index,'轉場時段檢查'] = '首案，請確認出門時間'
+            previous, origin = destination, label
+            previous_end = pd.to_datetime(_text(task.get('時間窗_結束')),format='%H:%M',errors='coerce')
+    return result
+
+
+def verify_schedule_google_travel(result_df, tasks, caregivers, config, max_queries=100):
+    """只核對已排路段；先計數，超限不發送任何 Google 請求。"""
+    allowed = _GOOGLE_ALLOWED.set(True)
+    queries = set()
+    collect = _GOOGLE_COLLECT.set(queries)
+    try:
+        preview = calculate_schedule_travel(result_df, tasks, caregivers, config)
+        if not preview.empty and preview['預估車程(分)'].isna().any():
+            raise ValueError('部分路段缺座標或時間，請先補齊；尚未發送 Google 查詢。')
+        if len(queries) > max_queries:
+            raise ValueError(f'已排班需要 {len(queries)} 筆 Google 查詢，超過上限 {max_queries}；尚未發送任何 Google 查詢。')
+        _GOOGLE_COLLECT.reset(collect)
+        collect = None
+        begin_travel_query_run(max_queries)
+        return calculate_schedule_travel(result_df, tasks, caregivers, config)
+    finally:
+        if collect is not None:
+            _GOOGLE_COLLECT.reset(collect)
+        _GOOGLE_ALLOWED.reset(allowed)
+
+
+def summarize_schedule_travel(result_df):
+    """每日交通與緩衝分開加總，缺一段則完整總計保持未知。"""
+    if result_df.empty:
+        return pd.DataFrame()
+    rows = []
+    for (cg_id, day), group in result_df.groupby(['派單居服員','交通日期'], sort=True):
+        missing = int(group['預估車程(分)'].isna().sum())
+        rows.append({'居服員ID':cg_id,'日期':day,'路段數':len(group),
+            '交通合計(分)': group['預估車程(分)'].sum() if not missing else np.nan,
+            '轉場緩衝合計(分)':group['路段緩衝(分)'].sum(),
+            '含緩衝合計(分)':group['含緩衝交通時間(分)'].sum() if not missing else np.nan,
+            '缺資料路段數':missing})
+    return pd.DataFrame(rows)
+
 
 # ==========================================
 # Phase 2: 時空路徑衝突過濾 + OR-Tools 多目標最佳化
 # ==========================================
+def _interval_travel(first, second, config, mode, task):
+    a_start,a_end,a_lat,a_lon = first
+    b_start,b_end,b_lat,b_lon = second
+    if a_end <= b_start:
+        origin,destination,depart = (a_lat,a_lon),(b_lat,b_lon),a_end
+    elif b_end <= a_start:
+        origin,destination,depart = (b_lat,b_lon),(a_lat,a_lon),b_end
+    else:
+        return float('inf')
+    return calc_travel_minutes(*origin,*destination,config,transport_mode=mode,
+                               departure_time=_task_clock(task,depart + timedelta(minutes=config.buffer_mins))) + config.buffer_mins
+
+
 def run_phase2_optimization(
     df_matches: pd.DataFrame,
     tasks: pd.DataFrame,
@@ -1871,6 +2279,7 @@ def run_phase2_optimization(
     只能競爭週期性任務排定後剩餘的時段，不會與其重疊。
     """
     # 建立居服員今日既定行程時間阻擋塊 (Time Blocks)。
+    transport_by_cg={r['居服員ID']:r.get('常用交通工具','機車') for _,r in df_cg.iterrows()}
     cg_busy = _build_cg_busy_blocks(df_cg)
     if extra_busy_blocks:
         for cg_id, blocks in extra_busy_blocks.items():
@@ -1878,6 +2287,7 @@ def run_phase2_optimization(
 
     # 建立任務時間表
     task_times = {}
+    task_rows = tasks.set_index('任務ID').to_dict('index')
     for _, task in tasks.iterrows():
         t_id = task["任務ID"]
         t1 = datetime.strptime(task["時間窗_開始"].strip(), "%H:%M")
@@ -1891,18 +2301,10 @@ def run_phase2_optimization(
         (b_lat, b_lon) for intervals in cg_busy.values() for (_, _, b_lat, b_lon) in intervals
     ]
     if not _use_google_routes():
-        if busy_coords:
-            prefetch_osrm_travel_times(
-                task_coords,
-                busy_coords,
-                config.travel_min_per_km,
-            )
-
-        prefetch_osrm_travel_times(
-            task_coords,
-            task_coords,
-            config.travel_min_per_km,
-        )
+        for mode in set(transport_by_cg.values()):
+            if busy_coords:
+                prefetch_osrm_travel_times(task_coords, busy_coords, config.travel_min_per_km, transport_mode=mode)
+            prefetch_osrm_travel_times(task_coords, task_coords, config.travel_min_per_km, transport_mode=mode)
 
     # 過濾掉與既定行程衝突（含轉場緩衝時間）的配對
     valid_rows = []
@@ -1913,8 +2315,8 @@ def run_phase2_optimization(
 
         conflict = False
         for b_start, b_end, b_lat, b_lon in cg_busy[cg_id]:
-            travel_mins = calc_travel_minutes(t_lat, t_lon, b_lat, b_lon, config) + config.buffer_mins
-            if not (
+            travel_mins = _interval_travel(task_times[t_id],(b_start,b_end,b_lat,b_lon),config,transport_by_cg.get(cg_id,'機車'),task_rows[t_id])
+            if not np.isfinite(travel_mins) or not (
                 t_end + timedelta(minutes=travel_mins) <= b_start
                 or b_end + timedelta(minutes=travel_mins) <= t_start
             ):
@@ -1928,6 +2330,8 @@ def run_phase2_optimization(
 
     result = {
         "df_valid": df_valid,
+        'df_matches': df_matches,
+        'matching_diagnostics':df_matches.attrs.get('matching_diagnostics',[]),
         "status": None,
         "df_result": pd.DataFrame(),
         "assigned_count": 0,
@@ -1938,6 +2342,14 @@ def run_phase2_optimization(
 
     # 建立 OR-Tools 混合整數規劃 (MIP) 求解器
     solver = pywraplp.Solver.CreateSolver("SCIP")
+    if solver is None:
+        raise RuntimeError('OR-Tools SCIP 求解器無法啟動')
+    solver.SetTimeLimit(config.solver_time_limit_ms)
+    solver.SetSolverSpecificParametersAsString(f"limits/gap = {config.solver_relative_gap}")
+    tasks_by_cg = df_valid.groupby("居服員ID", sort=False)["任務ID"].agg(list).to_dict()
+    caregivers_by_task = df_valid.groupby("任務ID", sort=False)["居服員ID"].agg(list).to_dict()
+    match_lookup = {(r["任務ID"], r["居服員ID"]): r for r in df_valid.to_dict("records")}
+    pair_travel_cache = {}
 
     X = {}
     for _, row in df_valid.iterrows():
@@ -1945,28 +2357,32 @@ def run_phase2_optimization(
             0, 1, f"x_{row['任務ID']}_{row['居服員ID']}"
         )
 
-    # 限制條件 1：每個任務至多只能派給一位居服員
+    # 限制條件 1：每個任務至多隻能派給一位居服員
     for t_id in df_valid["任務ID"].unique():
         solver.Add(
             sum(
                 X[(t_id, cg_id)]
-                for cg_id in df_valid[df_valid["任務ID"] == t_id]["居服員ID"]
+                for cg_id in caregivers_by_task[t_id]
             )
             <= 1
         )
 
     # 限制條件 2：同一居服員若被派兩個新任務，時間不能重疊且須預留轉場緩衝
     for cg_id in df_valid["居服員ID"].unique():
-        cg_tasks = df_valid[df_valid["居服員ID"] == cg_id]["任務ID"].tolist()
+        cg_tasks = tasks_by_cg[cg_id]
         for i in range(len(cg_tasks)):
             for j in range(i + 1, len(cg_tasks)):
                 t1_id, t2_id = cg_tasks[i], cg_tasks[j]
                 t1_start, t1_end, t1_lat, t1_lon = task_times[t1_id]
                 t2_start, t2_end, t2_lat, t2_lon = task_times[t2_id]
 
-                travel_mins = calc_travel_minutes(t1_lat, t1_lon, t2_lat, t2_lon, config) + config.buffer_mins
+                mode = transport_by_cg.get(cg_id, '機車')
+                cache_key = (t1_id, t2_id, mode)
+                if cache_key not in pair_travel_cache:
+                    pair_travel_cache[cache_key] = _interval_travel(task_times[t1_id],task_times[t2_id],config,mode,task_rows[t1_id])
+                travel_mins = pair_travel_cache[cache_key]
 
-                if not (
+                if not np.isfinite(travel_mins) or not (
                     t1_end + timedelta(minutes=travel_mins) <= t2_start
                     or t2_end + timedelta(minutes=travel_mins) <= t1_start
                 ):
@@ -1987,7 +2403,7 @@ def run_phase2_optimization(
     }
     for cg_id in df_valid["居服員ID"].unique():
         used_hours, cap_hours = cg_capacity.get(cg_id, (0.0, float("inf")))
-        cg_task_ids = df_valid[df_valid["居服員ID"] == cg_id]["任務ID"].unique()
+        cg_task_ids = tasks_by_cg[cg_id]
         solver.Add(
             sum(X[(t_id, cg_id)] * task_duration_hrs[t_id] for t_id in cg_task_ids)
             + used_hours
@@ -2031,15 +2447,13 @@ def run_phase2_optimization(
     status = solver.Solve()
     result["status"] = status
 
-    if status == pywraplp.Solver.OPTIMAL:
+    if status in (pywraplp.Solver.OPTIMAL, pywraplp.Solver.FEASIBLE):
         assigned_count = 0
         results = []
         for (t_id, cg_id), var in X.items():
             if var.solution_value() > 0.5:
                 assigned_count += 1
-                row_data = df_valid[
-                    (df_valid["任務ID"] == t_id) & (df_valid["居服員ID"] == cg_id)
-                ].iloc[0]
+                row_data = match_lookup[(t_id, cg_id)]
                 revenue, salary = task_revenue_map.get(t_id, (0.0, 0.0))
                 results.append(
                     {
@@ -2065,6 +2479,8 @@ def run_phase2_optimization(
                         "是否歷史首選": row_data.get("是否歷史首選", False),
                         "當月累計服務時數": row_data.get("當月累計服務時數", 0),
                         "服務強度係數": row_data.get("服務強度係數", 1),
+                        **{k:row_data.get(k) for k in ['疲勞資料狀態','滿意度資料狀態','本次計畫已排時數',
+                           '失智症資料狀態','特殊資格檢查','本次計畫加權負荷時數','照護難度參考係數','照護難度判斷依據','照護提示','服務碼必要證照','本次計畫負荷扣分','實際工時負荷扣分','資料來源','待確認事項','交通估算來源']},
                     }
                 )
 
@@ -2095,14 +2511,12 @@ def run_phase2_optimization(
         df_result = pd.DataFrame(results)
         if not df_result.empty:
             df_result = df_result.sort_values(by="任務ID")
-        result["df_result"] = df_result
+        result["df_result"] = calculate_schedule_travel(df_result, tasks, df_cg, config)
         result["assigned_count"] = assigned_count
 
     return result
 
-
 PERIODIC_TASK_COLUMN = "是否為週期性任務"
-
 
 def _is_periodic_task(value) -> bool:
     """將「是否為週期性任務」欄位值正規化為布林值。
@@ -2117,7 +2531,6 @@ def _is_periodic_task(value) -> bool:
         return value.strip().upper() == "TRUE"
     return bool(value)
 
-
 def _split_periodic_tasks(tasks: pd.DataFrame, periodic_column: str = PERIODIC_TASK_COLUMN):
     """依 periodic_column 將 tasks 拆分為 (週期性任務, 臨時單次任務)。
 
@@ -2128,7 +2541,6 @@ def _split_periodic_tasks(tasks: pd.DataFrame, periodic_column: str = PERIODIC_T
         return None, None
     is_periodic = tasks[periodic_column].apply(_is_periodic_task)
     return tasks[is_periodic].copy(), tasks[~is_periodic].copy()
-
 
 def _run_periodic_then_adhoc(
     periodic_tasks: pd.DataFrame,
@@ -2143,7 +2555,8 @@ def _run_periodic_then_adhoc(
     使臨時任務只能競爭週期性任務排定後「剩餘的居服員產能與時段」，不會與其重疊
     或反過來排擠週期性任務。
     """
-    empty_result = {"df_valid": pd.DataFrame(), "status": None, "df_result": pd.DataFrame(), "assigned_count": 0}
+    empty_result = {"df_valid": pd.DataFrame(), "status": None, "df_result": pd.DataFrame(), "assigned_count": 0,
+                    'df_matches':pd.DataFrame(),'matching_diagnostics':[]}
 
     periodic_result = empty_result
     if not periodic_tasks.empty:
@@ -2186,15 +2599,16 @@ def _run_periodic_then_adhoc(
     df_valid = pd.concat([periodic_result["df_valid"], adhoc_result["df_valid"]], ignore_index=True)
     df_result = pd.concat([df_periodic_result, adhoc_result["df_result"]], ignore_index=True)
     if not df_result.empty:
-        df_result = df_result.sort_values(by="任務ID")
+        df_result = calculate_schedule_travel(df_result, pd.concat([periodic_tasks, adhoc_tasks], ignore_index=True), df_cg, config)
 
     return {
         "df_valid": df_valid,
         "df_result": df_result,
         "status": adhoc_result["status"] if not adhoc_tasks.empty else periodic_result["status"],
         "assigned_count": periodic_result["assigned_count"] + adhoc_result["assigned_count"],
+        'df_matches':pd.concat([periodic_result['df_matches'],adhoc_result['df_matches']],ignore_index=True),
+        'matching_diagnostics':periodic_result['matching_diagnostics']+adhoc_result['matching_diagnostics'],
     }
-
 
 # ==========================================
 # 全月/按日批次派單：對每個日期各自執行 Phase 1 + Phase 2
@@ -2204,6 +2618,7 @@ def run_monthly_batch_dispatch(
     df_cg: pd.DataFrame,
     config: PipelineConfig,
     date_column: str = "日期",
+    progress_callback=None,
 ) -> dict:
     """依 `date_column`（預設「日期」）逐日切分 tasks，對每個日期各自獨立執行
     Phase 1 適配度評分與 Phase 2 OR-Tools 最佳化，再彙整為全期間派單總表。
@@ -2225,19 +2640,25 @@ def run_monthly_batch_dispatch(
 
     規則5（月排班動態時數滾動）：內部維護一份 df_cg 的可變工作副本
     `df_cg_working`，每完成一天的指派後，將當天各居服員實際獲派的服務時數
-    累加回其「當月累計服務時數(疲勞度)」欄位，供隔天 Phase 1 疲勞度懲罰納入計算
+    累加回其「本次計畫已排時數」欄位，供隔天 Phase 1 計畫負荷平衡納入計算
     （偏好派給累計時數較少者），以達到勞逸均衡；傳入的 df_cg 本身不會被修改。
     """
     daily_results: dict = {}
     result_frames = []
+    match_frames = []
+    diagnostics = []
     total_assigned_count = 0
 
     df_cg_working = df_cg.copy()
-    if "當月累計服務時數(疲勞度)" not in df_cg_working.columns:
-        df_cg_working["當月累計服務時數(疲勞度)"] = 0.0
+    if '本次計畫已排時數' not in df_cg_working:
+        df_cg_working['本次計畫已排時數'] = 0.0
 
+    if '本次計畫加權負荷時數' not in df_cg_working:
+        df_cg_working['本次計畫加權負荷時數'] = df_cg_working['本次計畫已排時數'].copy()
     unique_dates = sorted(tasks[date_column].dropna().unique())
-    for target_date in unique_dates:
+    for day_index, target_date in enumerate(unique_dates):
+        if progress_callback:
+            progress_callback(day_index, len(unique_dates), target_date)
         day_tasks = tasks[tasks[date_column] == target_date].copy()
         if day_tasks.empty:
             continue
@@ -2250,6 +2671,9 @@ def run_monthly_batch_dispatch(
             phase2_daily = _run_periodic_then_adhoc(periodic_tasks, adhoc_tasks, df_cg_working, config)
 
         daily_results[target_date] = phase2_daily
+        if not phase2_daily['df_matches'].empty:
+            match_frames.append(phase2_daily['df_matches'])
+        diagnostics.extend(phase2_daily['matching_diagnostics'])
 
         df_daily_result = phase2_daily["df_result"]
         if not df_daily_result.empty:
@@ -2260,29 +2684,43 @@ def run_monthly_batch_dispatch(
 
             day_tasks_by_id = day_tasks.set_index("任務ID")
             hours_by_cg: dict = {}
+            weighted_by_cg: dict = {}
             for _, row in df_daily_result.iterrows():
                 t_id = row["任務ID"]
                 cg_id = row["派單居服員"]
                 duration_hrs = day_tasks_by_id.loc[t_id, "服務歷時(分鐘)"] / 60.0
+                factor = _number(day_tasks_by_id.loc[t_id].get('照護難度參考係數'),1.0)
+                weighted_by_cg[cg_id] = weighted_by_cg.get(cg_id,0.0)+duration_hrs*factor
                 hours_by_cg[cg_id] = hours_by_cg.get(cg_id, 0.0) + duration_hrs
             for cg_id, hrs in hours_by_cg.items():
                 mask = df_cg_working["居服員ID"] == cg_id
-                df_cg_working.loc[mask, "當月累計服務時數(疲勞度)"] += hrs
+                df_cg_working.loc[mask, '本次計畫已排時數'] += hrs
+                df_cg_working.loc[mask, '本次計畫加權負荷時數'] += weighted_by_cg[cg_id]
 
+    if progress_callback:
+        progress_callback(len(unique_dates), len(unique_dates), None)
     df_result_all = pd.concat(result_frames, ignore_index=True) if result_frames else pd.DataFrame()
+    df_result_all = calculate_schedule_travel(df_result_all, tasks, df_cg, config)
 
     return {
         "daily_results": daily_results,
         "df_result_all": df_result_all,
         "total_assigned_count": total_assigned_count,
         "total_task_count": len(tasks),
+        'df_matches_all': pd.concat(match_frames,ignore_index=True) if match_frames else pd.DataFrame(),
+        'matching_diagnostics':diagnostics,
+        'caregiver_plan_hours':df_cg_working[['居服員ID','本次計畫已排時數']].copy(),
     }
-
 
 # ==========================================
 # Phase 3: 效益產出評估 (DiD 雙重差分比較)
 # ==========================================
 def run_phase3_did(df_hist: pd.DataFrame) -> dict:
+    required=['歷史媒合機制(Treatment)','案家滿意度(1-5)','不滿意導致提早結案(0/1)']
+    if df_hist.empty or any(c not in df_hist for c in required):
+        return {'available':False,'reason':'未提供歷史服務紀錄，無法估計滿意度差異或DiD效益',
+                'ai_group':pd.DataFrame(),'human_group':pd.DataFrame(),
+                **{k:np.nan for k in ['ai_sat','human_sat','ai_dropout','human_dropout','uplift_sat','uplift_dropout']}}
     ai_group = df_hist[df_hist["歷史媒合機制(Treatment)"] == 1]
     human_group = df_hist[df_hist["歷史媒合機制(Treatment)"] == 0]
 
@@ -2292,6 +2730,8 @@ def run_phase3_did(df_hist: pd.DataFrame) -> dict:
     human_dropout = human_group["不滿意導致提早結案(0/1)"].mean()
 
     return {
+        'available': not ai_group.empty and not human_group.empty,
+        'reason': '僅兩組平均差，缺前後期不能視為DiD因果效益',
         "ai_group": ai_group,
         "human_group": human_group,
         "ai_sat": ai_sat,
@@ -2302,16 +2742,14 @@ def run_phase3_did(df_hist: pd.DataFrame) -> dict:
         "uplift_dropout": human_dropout - ai_dropout,
     }
 
-
 # ==========================================
-# 居督人工覆寫稽核日誌 (Human-in-the-Loop override audit log)
+# 居督人工覆寫稽覈日誌 (Human-in-the-Loop override audit log)
 # ==========================================
 OVERRIDE_LOG_PATH = os.path.join("output_results", "supervisor_override_log.csv")
 
 OVERRIDE_LOG_COLUMNS = [
     "時間戳記", "任務ID", "案家ID", "AI推薦居服員ID", "居督指定居服員ID", "變更原因",
 ]
-
 
 def save_override_log(
     task_id,
@@ -2321,7 +2759,7 @@ def save_override_log(
     reason: str,
     log_path: str = OVERRIDE_LOG_PATH,
 ) -> None:
-    """將居督一筆人工覆寫紀錄以附加 (append) 方式寫入 CSV 稽核日誌。
+    """將居督一筆人工覆寫紀錄以附加 (append) 方式寫入 CSV 稽覈日誌。
 
     每次呼叫寫入一列；檔案不存在時先建立目錄與標題列。
     """
@@ -2340,45 +2778,84 @@ def save_override_log(
     write_header = not os.path.exists(log_path)
     entry.to_csv(log_path, mode="a", header=write_header, index=False, encoding="utf-8-sig")
 
-
 def load_override_log(log_path: str = OVERRIDE_LOG_PATH) -> pd.DataFrame:
-    """讀取現有稽核日誌；檔案不存在時回傳空的標準欄位 DataFrame。"""
+    """讀取現有稽覈日誌；檔案不存在時回傳空的標準欄位 DataFrame。"""
     if not os.path.exists(log_path):
         return pd.DataFrame(columns=OVERRIDE_LOG_COLUMNS)
     return pd.read_csv(log_path, encoding="utf-8-sig")
 
+def _privacy_mask_name(name):
+    """姓名顯示最小化：僅保留第一個字，其餘統一遮罩為 ○。
+    例如：王O明 / 王○明 / 王小明 -> 王○○。
+    """
+    text = _text(name)
+    if not text:
+        return ""
+    compact = "".join(text.split())
+    if len(compact) <= 1:
+        return "○"
+    return compact[0] + "○" * (len(compact) - 1)
 
-if __name__ == "__main__":
-    config = PipelineConfig()
 
-    # 測試 1：機車
-    motorcycle_mins = calc_travel_minutes(
-        25.0330,
-        121.5654,
-        25.0478,
-        121.5170,
-        config,
-        transport_mode="機車",
-    )
+def load_identity_mapping(source, kind, sheet_name=None):
+    """讀取姓名對照，只回傳 ID→遮罩姓名 dict；原姓名不併入排班 DataFrame、不送外部 API。"""
+    if kind not in ("caregiver", "client"):
+        raise ValueError("對照類型必須為 caregiver 或 client")
+    id_col, name_col = ("編號", "姓名") if kind == "caregiver" else ("案號", "個案姓名")
+    aliases = IDENTITY_SHEET_ALIASES[kind]
+    mappings = {}
 
-    print(
-        "機車 Google 交通時間：",
-        round(motorcycle_mins, 1),
-        "分鐘",
-    )
+    with pd.ExcelFile(source) as excel:
+        if sheet_name is not None:
+            candidates = [sheet_name] if sheet_name in excel.sheet_names else []
+        else:
+            candidates = [s for s in aliases if s in excel.sheet_names]
 
-    # 測試 2：大眾運輸
-    transit_mins = calc_travel_minutes(
-        25.0330,
-        121.5654,
-        25.0478,
-        121.5170,
-        config,
-        transport_mode="大眾運輸",
-    )
+        if len(candidates) == 0:
+            raise ValueError("找不到姓名對照工作表；可接受：" + "、".join(aliases))
+        if len(candidates) > 1:
+            raise ValueError("姓名對照工作表重複：" + "、".join(candidates))
 
-    print(
-        "大眾運輸 Google 交通時間：",
-        round(transit_mins, 1),
-        "分鐘",
-    )
+        sheet = candidates[0]
+        frame = pd.read_excel(excel, sheet_name=sheet, dtype=str)
+        if not {id_col, name_col}.issubset(frame.columns):
+            raise ValueError(f"工作表「{sheet}」需包含「{id_col}」「{name_col}」")
+
+        # 對照 sheet 僅允許 ID + 姓名，其他欄位不進入記憶體映射。
+        frame = frame[[id_col, name_col]].copy()
+        for _, row in frame.iterrows():
+            identifier, name = _text(row[id_col]), _text(row[name_col])
+            if not identifier and not name:
+                continue
+            if not identifier or not name:
+                raise ValueError(f"對照表「{sheet}」有空白 {id_col} 或 {name_col}，請補齊")
+            masked_name = _privacy_mask_name(name)
+            if identifier in mappings and mappings[identifier] != masked_name:
+                raise ValueError(f"同一 ID {identifier} 對應不同姓名，請確認後再載入")
+            # 個資最小化：mapping 僅保留遮罩後姓名，不保留原始／部分揭露姓名。
+            mappings[identifier] = masked_name
+    return mappings
+
+
+def load_identity_mappings_from_workbook(source):
+    """從同一份 6-sheet Excel 讀兩張姓名對照；只供本次 session 顯示／匯出使用。"""
+    return {
+        "clients": load_identity_mapping(source, "client"),
+        "caregivers": load_identity_mapping(source, "caregiver"),
+    }
+
+def identity_display(frame, caregivers=None, clients=None):
+    """只產生顯示／匯出副本，不更改用於計算或人工改派的 ID。"""
+    if not isinstance(frame,pd.DataFrame):return frame
+    caregivers,clients = caregivers or {},clients or {}
+    out=frame.copy()
+    caregiver_cols={'居服員ID','編號','派單居服員','原派居服員','新派居服員','最終派單居服員','AI建議居服員','歷史首選居服員ID','請假居服員'}
+    client_cols={'案家ID','案號','內部案號'}
+    for col in out.columns:
+        mapping = caregivers if col in caregiver_cols else (clients if col in client_cols else None)
+        if mapping is not None:
+            out[col]=out[col].map(lambda v:f'{_text(v)}｜{mapping[_text(v)]}' if _text(v) in mapping else v)
+        elif col in {'交通起點','交通終點','交通路段'} and clients:
+            pattern=r'(?<![A-Za-z0-9])('+'|'.join(re.escape(k) for k in sorted(clients,key=len,reverse=True))+r')(?![A-Za-z0-9])'
+            out[col]=out[col].map(lambda v:re.sub(pattern,lambda m:m[1]+'｜'+clients[m[1]],v) if isinstance(v,str) else v)
+    return out
