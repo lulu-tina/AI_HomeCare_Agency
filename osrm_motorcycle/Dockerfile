@@ -29,4 +29,4 @@ WORKDIR /data
 
 COPY --from=builder /data /data
 
-CMD ["sh", "-c", "osrm-routed --algorithm mld --ip 0.0.0.0 --port ${PORT:-10000} --mmap /data/taiwan.osrm"]
+CMD ["sh", "-c", "osrm-routed --algorithm mld --ip 0.0.0.0 --port ${PORT:-10000} /data/taiwan.osrm"]
