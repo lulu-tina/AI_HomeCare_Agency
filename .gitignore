@@ -3,3 +3,7 @@ __pycache__/
 *.bak*
 .streamlit/secrets.toml
 00_DB/*.xlsx
+
+osrm_motorcycle/data/
+output_results/
+.streamlit/secrets.toml
