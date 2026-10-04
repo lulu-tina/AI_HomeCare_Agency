@@ -79,11 +79,12 @@ except ModuleNotFoundError as exc:
 
 from caregiver_engine import (
 
+    _check_hard_constraints,
+
     DEFAULT_EXCEL_PATH,
     google_key_is_configured,
     begin_travel_query_run,
     set_google_queries_enabled,
-    verify_schedule_google_travel,
     load_agency_workbook,
     load_identity_mapping,
     load_identity_mappings_from_workbook,
@@ -260,16 +261,9 @@ REQUIRED_TASKS_COLUMNS = ["任務ID", "案家ID", "時間窗_開始", "時間窗
 
 #Service_Code_2、Units_2不用列為必填，因為有些任務只有一個服務碼。
 
-st.set_page_config(page_title="長照居家照顧 AI 派單系統", page_icon="🏠", layout="wide")
-
-st.title("🏠 長照居家照顧 AI 派單系統")
-
-st.caption("居督與營運團隊可上傳／編輯排班資料、調整派單政策參數，並一鍵執行 AI 最佳化派單")
-
-st.info(
-    "🔒 個資保護模式：排班核心只使用內部 ID；姓名對照與運算資料分離。"
-    "姓名預設不顯示、不進入 Google Routes/OSRM 請求，匯出預設為代碼版。"
-)
+st.set_page_config(page_title="CareFlow｜智慧居服排班", page_icon="🌿", layout="wide")
+from careflow_ui import render_brand, section_title, render_summary
+render_brand()
 
 # ==========================================
 
@@ -278,15 +272,20 @@ st.info(
 # ==========================================
 
 defaults = PipelineConfig()
-# 候選配對及一般重跑皆禁止 Google；完成草案後的核對才暫時開啟。
-set_google_queries_enabled(False)
+# 固定交通來源：機車=OSRM；大眾運輸=Google Routes TRANSIT。
+set_google_queries_enabled(True)
 
 def reset_policy_defaults():
-    for key in ['cfg_buffer_mins','cfg_travel_penalty_weight','cfg_urgent_priority_bonus','cfg_continuity_bonus','cfg_skill_bonus','cfg_salary_rate_pct','google_query_limit','google_auto_verify']:
+    for key in ['cfg_buffer_mins','cfg_travel_penalty_weight','cfg_urgent_priority_bonus','cfg_continuity_bonus','cfg_previous_week_bonus','cfg_skill_bonus','cfg_salary_rate_pct','google_query_limit']:
         st.session_state.pop(key, None)
 
 with st.sidebar:
-    st.subheader('排班設定')
+    st.markdown("### 🌿 CareFlow")
+    st.caption("智慧居服排班工作台")
+    st.markdown('<nav class="cf-nav"><a href="#import-data" target="_self">01　匯入資料</a><a href="#review-data" target="_self">02　檢查與編輯</a><a href="#schedule" target="_self">03　開始排班</a></nav>', unsafe_allow_html=True)
+    st.divider()
+    st.subheader('排班偏好')
+    st.caption('一般使用可保留預設值；進階選項按需展開。')
     salary_rate_pct = st.slider(
 
         "居服員拆帳比例（%）", 0, 100, int(defaults.caregiver_salary_rate_per_point * 100), 5,
@@ -302,31 +301,29 @@ with st.sidebar:
     st.caption('交通：OSRM＋Google（機車／公車捷運）')
     st.session_state['careflow_travel_provider'] = 'hybrid'
     provider = 'hybrid'
-    google_auto_verify = False
-    google_query_limit = 100
-    if st.session_state.get('_google_limit_default_version') != 2:
-        st.session_state['google_query_limit'] = 100
-        st.session_state['_google_limit_default_version'] = 2
+    google_query_limit = 12000
+    if st.session_state.get('_google_limit_default_version') != 4:
+        st.session_state['google_query_limit'] = 12000
+        st.session_state['_google_limit_default_version'] = 4
     with st.expander('交通進階設定',expanded=False):
         if provider in ('osrm','hybrid'):
             st.text_input('OSRM 機車服務網址', value=os.getenv('CAREFLOW_OSRM_MOTORCYCLE_HOST','http://127.0.0.1:5001'), key='CAREFLOW_OSRM_MOTORCYCLE_HOST')
         if provider in ('google','hybrid'):
-            google_query_limit = st.number_input('每次核對 Google 查詢上限',min_value=1,max_value=100000,value=100,step=100,key='google_query_limit',help='只查已排班實際路段。先檢查路段數，超限不發送查詢；提高上限可能增加費用。')
-        if provider == 'hybrid':
-            google_auto_verify = st.checkbox('排班成功後自動核對公車／捷運', value=True, key='google_auto_verify', help='只查已派路段；候選配對不使用 Google。關閉後可手動按核對。')
+            google_query_limit = st.number_input('每次排班 Google Transit elements 安全上限',min_value=100,max_value=100000,step=500,key='google_query_limit',help='Google ComputeRouteMatrix 依 origins × destinations 計算 elements。系統會批次查詢並快取；這是安全上限，不代表一定會用到這麼多。')
 
-    continuity_bonus = st.slider(
-
-        "照護連續性加分（歷史首選居服員）", 0.0, 100.0, defaults.preferred_caregiver_bonus, 1.0,
-
-        key="cfg_continuity_bonus",
-
-        help="若候選居服員等於案家的「歷史首選居服員ID」，即獲得此加分。"
-
-        "目前預設為 +60 分；若該居服員歷史滿意度 ≥ 4.3，系統另再加 +15 分。"
-        "尚未填寫歷史首選居服員ID時，不會套用這項加分。",
-
+    previous_week_bonus = st.slider(
+        "上一週同案家居服員加分",
+        0.0, 150.0, 80.0, 1.0,
+        key="cfg_previous_week_bonus",
+        help="同一案家若上一週主要由某位居服員服務，本週該居服員只要通過資格、請假、時段等硬限制，適配度額外 +80 分。不是硬鎖定。",
     )
+    continuity_bonus = 0.0
+    _pw_map = st.session_state.get("careflow_previous_week_map", {})
+    if _pw_map:
+        st.caption(f"已承接上一週班表：{len(_pw_map)} 個案有連續性偏好。")
+    else:
+        st.caption("目前尚無上一週班表；完成第一週排班後，下一週會自動承接同案居服員。歷史首選目前不使用。")
+
 
     with st.expander('派單進階設定', expanded=False):
         buffer_mins = st.slider(
@@ -355,14 +352,14 @@ with st.sidebar:
         st.button('🔄 還原預設值', width='stretch', on_click=reset_policy_defaults)
 
     with st.expander('交通說明',expanded=False):
-        st.caption('機車走自架 OSRM；混合模式的公車／捷運走 Google，依 Excel 交通工具自動分流。')
-        st.caption('OSRM／Google 會將座標送往指定路網服務。本機概算不含道路、公車班次或即時路況。')
+        st.caption('交通來源固定：機車走自架 OSRM；公車／捷運走 Google Routes TRANSIT，依 Excel 交通工具自動分流。')
+        st.caption('OSRM／Google 會將座標送往指定路網服務；大眾運輸不再使用本機直線概算。')
         if provider in ('google','hybrid'):
             if google_key_is_configured():
                 st.caption('Google 金鑰：已讀取設定（未驗證 API 權限）。')
             else:
                 st.warning('未讀到 Google 金鑰，請確認此專案的 .streamlit/secrets.toml 有 GOOGLE_MAPS_API_KEY。')
-            st.caption('候選配對不呼叫 Google；混合模式排班成功後只核對已排公車／捷運路段，可在進階設定關閉自動核對。預設上限 100。')
+            st.caption('交通來源固定：機車使用自架 OSRM；大眾運輸從候選配對、排班到轉場時間皆使用 Google Routes TRANSIT。')
 
     urgent_priority_bonus = defaults.urgent_priority_bonus
     skill_bonus = defaults.cert_bonus_dementia
@@ -376,6 +373,7 @@ config = PipelineConfig(
     urgent_priority_bonus=urgent_priority_bonus,
 
     preferred_caregiver_bonus=continuity_bonus,
+    previous_week_caregiver_bonus=previous_week_bonus,
 
     cert_bonus_dementia=skill_bonus,
 
@@ -436,50 +434,56 @@ def _read_raw_sheets(file_or_path):
 
 try:
     if input_mode == '機構資料（單一Excel／三個工作表）':
-        st.subheader('匯入 6-sheet 機構資料，產生排班草案')
-        st.warning('以資格文字、交通、服務時間及本次已排工作負荷配對。滿意度與首選居服員未提供，暫不使用這兩項評分。')
-        agency_file=st.file_uploader('上傳機構資料 Excel（6 個工作表）',
+        section_title('import-data', '01', '匯入排班資料', '上傳機構 Excel，再選擇要安排的日期。')
+        st.caption('依資格、交通、服務時段與工作量配對；滿意度與歷史首選尚未納入。')
+        agency_file=st.file_uploader('拖曳 Excel 到這裡，或點選瀏覽檔案',
                                     type=['xlsx'],key='agency_workbook')
         local_dir=pathlib.Path(os.getenv('CAREFLOW_AGENCY_DIR','./00_DB'))
         local_file=local_dir/'居服機構資料_三工作表.xlsx'
         agency_source=agency_file if agency_file is not None else (local_file if local_file.exists() else None)
         if agency_source is None:
-            st.info('請上傳一份 Excel，包含「員工資料」「個案資料」「週服務計畫」「Service_code」「案家姓名對照」「居服員姓名對照」6 個工作表。')
+            st.markdown('<div class="cf-empty"><span>📂</span><h3>從一份 Excel 開始</h3><p>上傳後即可確認資料、設定日期並產生排班草案。</p></div>', unsafe_allow_html=True)
+            with st.expander('Excel 需要哪些工作表？'):
+                st.write('請包含：員工資料、個案資料、週服務計畫、Service_code、案家姓名對照、居服員姓名對照。')
             st.stop()
         day1,day2=st.columns(2)
         today=pd.Timestamp.now(tz='Asia/Taipei').date()
         range_start=day1.date_input('排班開始日',value=today,key='agency_range_start')
         range_end=day2.date_input('排班結束日',value=today+pd.Timedelta(days=6),key='agency_range_end')
+        if range_end < range_start:
+            st.error('結束日需在開始日當天或之後，請重新選擇日期。')
+            st.stop()
         available_start=pd.Timestamp('08:00').time()
         available_end=pd.Timestamp('21:00').time()
         cap=8.0
         confirmed=True
         st.caption('預設可服務時段 08:00～21:00，每日服務時數上限 8 小時；休息日及請假仍排除。可於下方員工表逐人調整。')
-        with st.expander('進階設定',expanded=False):
-            solve_mode=st.selectbox('求解模式',['快速（每次最多 10 秒，容許 1% 最佳化差距）','極速（每次最多 5 秒，可能少派）','完整（每次最多 30 秒）'],key='agency_solve_mode')
+        with st.expander('排班速度與求解模式',expanded=False):
+            solve_mode=st.selectbox('求解模式',['快速（每次最多 3 秒，容許 3% 最佳化差距）','極速（每次最多 1 秒，可能少派）','完整（每次最多 15 秒）'],key='agency_solve_mode')
         anchor=True
         st.caption('隔週服務自動以生效日所在週起算，每隔一週安排；不早於生效日，並配合原服務星期與到期日。')
         sheets=load_agency_workbook(agency_source,range_start,range_end,daily_start=available_start.strftime('%H:%M'),
             daily_end=available_end.strftime('%H:%M'),daily_cap=cap,availability_confirmed=confirmed,biweekly_anchor_confirmed=anchor)
-        config.solver_time_limit_ms=10000 if solve_mode.startswith('快速') else (5000 if solve_mode.startswith('極速') else 30000)
-        config.solver_relative_gap=0.0 if solve_mode.startswith('完整') else 0.01
-        st.caption('快速模式：每次求解最多 10 秒，容許目標分數距最佳上界 1% 即提早完成；進階設定另有 5 秒極速與 30 秒完整模式。匯入、配對、建模與繪圖時間另計。')
-        config.plan_load_mode='hours'
-        config.fatigue_reference_hours=40.0
-        config.fatigue_weight=10.0
-        timing_mode='機構原計畫分鐘'
-        sheets['Tasks']['使用Service_code重算']=False
-        sheets['Import_Issues']=sheets['Import_Issues'].loc[sheets['Import_Issues']['資料表'].ne('Service_code')].copy()
-        st.caption('服務時間採週服務計畫的原服務分鐘；多日排班沿用已排總時數扣分，協助分配後續日期的工作量。')
-        st.info('資格配對直接讀取員工的「取得資格」文字，不需另填登錄確認。失智個案請在個案表標記「失智症個案(0/1)」；身障第1類不會直接當成失智。')
-        st.caption('難度規則為機構參考：核定等級與失能／障礙程度取最大係數；身障類別只提供提示。')
+        config.solver_time_limit_ms=3000 if solve_mode.startswith('快速') else (1000 if solve_mode.startswith('極速') else 15000)
+        config.solver_relative_gap=0.0 if solve_mode.startswith('完整') else 0.03
+        with st.expander('排班規則與計算說明', expanded=False):
+            st.caption('快速模式：每次求解最多 3 秒，容許 3% 最佳化差距；進階設定另有 1 秒極速與 15 秒完整模式。匯入、配對、建模與繪圖時間另計。')
+            config.plan_load_mode='hours'
+            config.fatigue_reference_hours=40.0
+            config.fatigue_weight=10.0
+            timing_mode='機構原計畫分鐘'
+            sheets['Tasks']['使用Service_code重算']=False
+            sheets['Import_Issues']=sheets['Import_Issues'].loc[sheets['Import_Issues']['資料表'].ne('Service_code')].copy()
+            st.caption('服務時間採週服務計畫的原服務分鐘；多日排班沿用已排總時數扣分，協助分配後續日期的工作量。')
+            st.info('資格配對直接讀取員工的「取得資格」文字，不需另填登錄確認。失智個案請在個案表標記「失智症個案(0/1)」；身障第1類不會直接當成失智。')
+            st.caption('難度規則為機構參考：核定等級與失能／障礙程度取最大係數；身障類別只提供提示。')
         tasks_sheet_name='機構週服務展開任務'
         digest=hashlib.sha256()
         digest.update(agency_source.getvalue() if hasattr(agency_source,'getvalue') else pathlib.Path(agency_source).read_bytes())
         digest.update(str((range_start,range_end,available_start,available_end,cap,confirmed,anchor,timing_mode)).encode())
         digest.update(sheets['Service_Code'].to_json(force_ascii=False).encode())
         source_key='agency::'+digest.hexdigest()
-        st.caption(f"匯入 {len(sheets['Caregiver_Profiles'])} 位員工、{len(sheets['Client_Profiles'])} 個有案號個案；展開 {len(sheets['Tasks'])} 筆日期任務。")
+        render_summary(len(sheets['Caregiver_Profiles']), len(sheets['Client_Profiles']), len(sheets['Tasks']))
         if not sheets['Import_Issues'].empty:
             st.warning('以下資料需補正；缺鍵、無效服務列不產生任務，重疊服務任務保留但暫不派單。')
             show_table(sheets['Import_Issues'],hide_index=True,width='stretch')
@@ -561,63 +565,64 @@ if st.session_state.get("_data_source_key") != source_key:
 
 # ==========================================
 
-st.header("① 服務碼組合檢查")
+section_title('review-data', '02', '確認排班資料', '需要調整時，展開下方資料表直接編輯。')
+with st.expander('服務碼組合檢查與提醒', expanded=False):
 
-st.caption(
+    st.caption(
 
-    "依目前資料提示程式既有服務碼組合規則；規則版本未核定，需由機構複核。"
+        "依目前資料提示程式既有服務碼組合規則；規則版本未核定，需由機構複核。"
 
-    "本健檢僅檢核與提示、不會排除任何任務，亦不影響下方③區塊的派單運算。"
+        "本健檢僅檢核與提示、不會排除任何任務，亦不影響下方③區塊的派單運算。"
 
-)
+    )
 
-try:
+    try:
 
-    _merged_preview = merge_task_client_tables(st.session_state["edit_tasks"], st.session_state["edit_cl"])
+        _merged_preview = merge_task_client_tables(st.session_state["edit_tasks"], st.session_state["edit_cl"])
 
-    _validated_preview = validate_ba_codes(_merged_preview)
+        _validated_preview = validate_ba_codes(_merged_preview)
 
-    _total_tasks_preview = len(_validated_preview)
+        _total_tasks_preview = len(_validated_preview)
 
-    _violation_count = int(_validated_preview["含違規代碼"].sum())
+        _violation_count = int(_validated_preview["含違規代碼"].sum())
 
-    _qualified_count = _total_tasks_preview - _violation_count
+        _qualified_count = _total_tasks_preview - _violation_count
 
-    h1, h2, h3 = st.columns(3)
+        h1, h2, h3 = st.columns(3)
 
-    h1.metric("總任務數", f"{_total_tasks_preview}")
+        h1.metric("總任務數", f"{_total_tasks_preview}")
 
-    h2.metric("沒有組合提醒的任務數", f"{_qualified_count}")
+        h2.metric("沒有組合提醒的任務數", f"{_qualified_count}")
 
-    h3.metric("⚠️ 需要檢查服務碼組合的任務數", f"{_violation_count}")
+        h3.metric("⚠️ 需要檢查服務碼組合的任務數", f"{_violation_count}")
 
-    if _violation_count > 0:
+        if _violation_count > 0:
 
-        st.warning(
+            st.warning(
 
-            f"偵測到 {_violation_count} 筆任務的 BA 服務代碼併報疑似違反長照給付支付基準規則，"
+                f"偵測到 {_violation_count} 筆任務的 BA 服務代碼併報疑似違反長照給付支付基準規則，"
 
-            "建議於下方②區塊修正服務代碼，或由居督複核後仍可略過警告繼續派單。"
+                "建議於下方②區塊修正服務代碼，或由居督複核後仍可略過警告繼續派單。"
 
-        )
+            )
 
-        show_table(
+            show_table(
 
-            _validated_preview.loc[_validated_preview["含違規代碼"], ["任務ID", "案家ID", "BA代碼檢核異常"]],
+                _validated_preview.loc[_validated_preview["含違規代碼"], ["任務ID", "案家ID", "BA代碼檢核異常"]],
 
-            width="stretch",
+                width="stretch",
 
-            hide_index=True,
+                hide_index=True,
 
-        )
+            )
 
-    else:
+        else:
 
-        st.success("目前未命中程式既有服務碼提示；不代表已完成申報合規審核。")
+            st.success("目前未命中程式既有服務碼提示；不代表已完成申報合規審核。")
 
-except Exception as e:
+    except Exception as e:
 
-    st.info(f"暫無法執行 BA 代碼健檢（請確認任務與案家資料的「案家ID」欄位可正常對應）：{e}")
+        st.info(f"暫無法執行 BA 代碼健檢（請確認任務與案家資料的「案家ID」欄位可正常對應）：{e}")
 
 # ==========================================
 
@@ -625,101 +630,148 @@ except Exception as e:
 
 # ==========================================
 
-st.header("② 資料載入與編輯")
+with st.expander("檢視／編輯居服員、案家與服務任務", expanded=False):
 
-def render_editable_sheet(session_key: str):
+    def render_editable_sheet(session_key: str):
 
-    with st.expander("➕ 新增欄位"):
+        with st.expander("➕ 新增欄位"):
 
-        c1, c2 = st.columns([3, 1])
+            c1, c2 = st.columns([3, 1])
 
-        new_col_name = c1.text_input("欄位名稱", key=f"newcol_input_{session_key}", label_visibility="collapsed",
+            new_col_name = c1.text_input("欄位名稱", key=f"newcol_input_{session_key}", label_visibility="collapsed",
 
-                                      placeholder="輸入新欄位名稱")
+                                          placeholder="輸入新欄位名稱")
 
-        if c2.button("新增欄位", key=f"newcol_btn_{session_key}", width="stretch"):
+            if c2.button("新增欄位", key=f"newcol_btn_{session_key}", width="stretch"):
 
-            df_current = st.session_state[session_key]
+                df_current = st.session_state[session_key]
 
-            if not new_col_name:
+                if not new_col_name:
 
-                st.warning("請先輸入欄位名稱。")
+                    st.warning("請先輸入欄位名稱。")
 
-            elif new_col_name in df_current.columns:
+                elif new_col_name in df_current.columns:
 
-                st.warning(f"欄位「{new_col_name}」已存在。")
+                    st.warning(f"欄位「{new_col_name}」已存在。")
 
-            else:
+                else:
 
-                df_current[new_col_name] = None
+                    df_current[new_col_name] = None
 
-                st.session_state[session_key] = df_current
+                    st.session_state[session_key] = df_current
 
-                st.rerun()
+                    st.rerun()
 
-    df = st.session_state[session_key]
+        df = st.session_state[session_key]
 
-    transport_columns = {}
-    if session_key == 'edit_cg':
-        transport_columns['常用交通工具'] = st.column_config.SelectboxColumn('常用交通工具', options=['機車','大眾運輸'], required=True, help='大眾運輸代表公車／捷運。')
-    edited = st.data_editor(
+        transport_columns = {}
+        if session_key == 'edit_cg':
+            transport_columns['常用交通工具'] = st.column_config.SelectboxColumn('常用交通工具', options=['機車','大眾運輸'], required=True, help='大眾運輸代表公車／捷運。')
+        edited = st.data_editor(
 
-        df,
-        column_config=transport_columns,
+            df,
+            column_config=transport_columns,
 
-        num_rows="dynamic",
+            num_rows="dynamic",
 
-        width="stretch",
+            width="stretch",
 
-        key=f"editor_{session_key}_{len(df.columns)}",
+            key=f"editor_{session_key}_{len(df.columns)}",
 
-    )
+        )
 
-    st.session_state[session_key] = edited
+        st.session_state[session_key] = edited
 
-tab_cg, tab_cl, tab_tasks, tab_service_code = st.tabs([
+    tab_cg, tab_cl, tab_tasks, tab_service_code = st.tabs([
 
-    "居服員資料 (Caregiver_Profiles)",
+        "居服員",
 
-    "案家資料 (Client_Profiles)",
+        "案家",
 
-    f"任務資料 ({st.session_state['tasks_sheet_name']})",
+        "服務任務",
 
-     "服務碼主檔 (Service_Code)",
+         "服務碼",
 
-])
+    ])
 
-with tab_cg:
+    with tab_cg:
 
-    st.caption("可直接編輯儲存格、新增／刪除列（勾選列號後按 Delete），或透過「新增欄位」新增自訂欄位。")
+        st.caption("可直接編輯儲存格、新增／刪除列（勾選列號後按 Delete），或透過「新增欄位」新增自訂欄位。")
 
-    render_editable_sheet("edit_cg")
+        render_editable_sheet("edit_cg")
 
-with tab_cl:
+    with tab_cl:
 
-    st.caption("可直接編輯儲存格、新增／刪除列，或透過「新增欄位」新增自訂欄位。")
+        st.caption("可直接編輯儲存格、新增／刪除列，或透過「新增欄位」新增自訂欄位。")
 
-    render_editable_sheet("edit_cl")
+        render_editable_sheet("edit_cl")
 
-with tab_tasks:
+    with tab_tasks:
 
-    st.caption("可直接編輯儲存格、新增／刪除列，或透過「新增欄位」新增自訂欄位。")
+        st.caption("可直接編輯儲存格、新增／刪除列，或透過「新增欄位」新增自訂欄位。")
 
-    render_editable_sheet("edit_tasks")
+        render_editable_sheet("edit_tasks")
 
-with tab_service_code:
+    with tab_service_code:
 
-    st.caption('機構資料採已提供服務分鐘，不用未核定的Master覆蓋。此處保留服務碼清單；原版資料仍可依Master計算。')
+        st.caption('機構資料採已提供服務分鐘，不用未核定的Master覆蓋。此處保留服務碼清單；原版資料仍可依Master計算。')
 
-    render_editable_sheet("edit_service_code")
+        render_editable_sheet("edit_service_code")
 
-# ==========================================
+    # ==========================================
+
+
+def build_previous_week_assignment_map_from_csv(uploaded_file):
+    if uploaded_file is None:
+        return {}, {}, {}
+    df = pd.read_csv(uploaded_file)
+    required = {"任務ID", "派單居服員"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError("上一週班表缺少必要欄位：" + "、".join(sorted(missing)))
+    df = df.copy()
+    df["任務ID"] = df["任務ID"].astype(str).str.strip()
+    df["派單居服員"] = df["派單居服員"].astype(str).str.strip()
+    df = df[
+        (df["任務ID"] != "")
+        & (df["派單居服員"] != "")
+        & (df["派單居服員"] != "未指派")
+    ].copy()
+    if df.empty:
+        raise ValueError("上一週班表沒有可用的已指派資料。")
+    df["_key"] = df["任務ID"].str.replace(r"_\d{8}$", "", regex=True)
+    df = df.drop_duplicates("_key", keep="last")
+    exact_map = dict(zip(df["_key"], df["派單居服員"]))
+    client_map = {}
+    if "案家ID" in df.columns:
+        tmp = df[["案家ID", "派單居服員"]].dropna().copy()
+        tmp["案家ID"] = tmp["案家ID"].astype(str).str.strip()
+        tmp = tmp[tmp["案家ID"] != ""]
+        if not tmp.empty:
+            counts = (
+                tmp.groupby(["案家ID", "派單居服員"], as_index=False)
+                .size()
+                .sort_values(
+                    ["案家ID", "size", "派單居服員"],
+                    ascending=[True, False, True],
+                    kind="stable",
+                )
+                .drop_duplicates("案家ID", keep="first")
+            )
+            client_map = dict(
+                zip(counts["案家ID"].astype(str), counts["派單居服員"].astype(str))
+            )
+    return exact_map, client_map, {
+        "rows": len(df),
+        "caregivers": df["派單居服員"].nunique(),
+    }
+
 
 # 區塊③：一鍵執行與成果儀錶板
 
 # ==========================================
 
-st.header("③ 執行最佳化派單與成果儀錶板")
+section_title('schedule', '03', '開始排班', '先產生第一週草案，確認後再延展後續班表。')
 _live_signature = hashlib.sha256()
 for _key in ['edit_cg','edit_cl','edit_tasks','edit_service_code']:
     _live_signature.update(st.session_state[_key].to_json(date_format='iso',default_handler=str).encode())
@@ -733,153 +785,345 @@ if 'last_result' in st.session_state and st.session_state['last_result'].get('in
     st.session_state.pop('last_result',None)
     st.session_state.pop('overrides',None)
 
+
 _tasks_preview_df = st.session_state["edit_tasks"]
 
+# ============================================================
+# 週排主流程：
+# 1) AI 完整只排第一週 7 天
+# 2) 居督確認第一週
+# 3) 延展時，已有固定配對直接沿用
+# 4) 第一週沒出現、之後才第一次出現的隔週/新服務，只在首次出現時 AI 排一次
+# 5) 之後同週期沿用，不再重算
+# ============================================================
 has_date_column = "日期" in _tasks_preview_df.columns
-
-schedule_mode = "單日排程"
-
-selected_schedule_date = None
-
-if has_date_column:
-
-    schedule_mode = st.radio(
-
-        "排程範圍",
-
-        ["單日排程", "期間逐日排程"],
-
-        horizontal=True,
-
-        key="schedule_mode",
-
-        help="偵測到任務資料含「日期」欄位：可選擇僅排單一天的班表，或一次排完整個月"
-
-        "（依日期逐日各自求解 Phase 1 + Phase 2 後彙整為全期間派單總表）。",
-
-    )
-
-    if schedule_mode == "單日排程":
-
-        available_dates = sorted(_tasks_preview_df["日期"].dropna().unique())
-
-        if available_dates:
-
-            selected_schedule_date = st.selectbox("選擇排程日期", available_dates, key="schedule_selected_date")
-
 new_dispatch_completed = False
-if st.button("🚀 執行 AI 最佳化派單", type="primary"):
 
-    begin_travel_query_run(google_query_limit)
-    df_cg = st.session_state["edit_cg"].copy()
+def _weekly_task_key(task_or_id):
+    # W0411_20261101 -> W0411
+    # W0411_20261115 -> W0411
+    if isinstance(task_or_id, pd.Series):
+        task_id = str(task_or_id.get("任務ID", "") or "").strip()
+    elif isinstance(task_or_id, dict):
+        task_id = str(task_or_id.get("任務ID", "") or "").strip()
+    else:
+        task_id = str(task_or_id or "").strip()
+    return re.sub(r"_\d{8}$", "", task_id)
 
-    df_cl = st.session_state["edit_cl"].copy()
+def _build_baseline_map(result_df):
+    if result_df is None or result_df.empty:
+        return {}
+    out = {}
+    for _, row in result_df.iterrows():
+        task_id = str(row.get("任務ID", "") or "").strip()
+        cg_id = str(row.get("派單居服員", "") or "").strip()
+        if not task_id or not cg_id or cg_id == "未指派":
+            continue
+        out[_weekly_task_key(task_id)] = cg_id
+    return out
 
-    df_hist = st.session_state["data_hist"].copy()
+def _make_carried_rows(pairs, day_tasks, cfg):
+    if not pairs:
+        return pd.DataFrame()
 
-    df_tasks = st.session_state["edit_tasks"].copy()
+    finance = calculate_task_revenue_and_salary(day_tasks, cfg)
+    finance_lookup = finance.set_index("任務ID").to_dict("index")
+    task_lookup = day_tasks.set_index("任務ID").to_dict("index")
 
-    df_service_code = (
+    rows = []
+    for task_id, cg_id in pairs:
+        task = task_lookup[task_id]
+        fin = finance_lookup.get(task_id, {})
+        rows.append({
+            "任務ID": task_id,
+            "案家ID": task.get("案家ID"),
+            "派單居服員": cg_id,
+            "適配分數": float(
+                cfg.base_score
+                + getattr(cfg, "previous_week_caregiver_bonus", 80.0)
+            ),
+            "預估車程(分)": None,
+            "服務時段": f"{task.get('時間窗_開始')}-{task.get('時間窗_結束')}",
+            "任務優先級": task.get("任務優先級", "一般"),
+            "地點緯度": task.get("服務地點_緯度"),
+            "地點經度": task.get("服務地點_經度"),
+            "預估長照申報點數(營收)": fin.get("預估長照申報點數(營收)"),
+            "預估居服員拆帳薪資": fin.get("預估居服員拆帳薪資"),
+            "排班來源": "基準班表直接延展",
+            "原首選替換原因": "已確認固定配對直接延展",
+        })
+    return pd.DataFrame(rows)
 
-    st.session_state["edit_service_code"].copy()
+def _run_ai_by_day(tasks_for_ai, caregivers, cfg, label):
+    frames = []
+    match_frames = []
+    diagnostics = []
 
+    dates = sorted(
+        pd.to_datetime(tasks_for_ai["日期"], errors="coerce")
+        .dropna()
+        .dt.date
+        .unique()
     )
 
-    if has_date_column and schedule_mode == "單日排程" and selected_schedule_date is not None:
+    progress = st.progress(0.0, text=f"{label}…")
 
-        df_tasks = df_tasks[df_tasks["日期"] == selected_schedule_date].copy()
-
-    try:
-
-        # 先依Service Code Master重算服務歷時
-
-        df_tasks = apply_service_duration(
-
-            df_tasks,
-
-            df_service_code,
-
+    for i, day in enumerate(dates):
+        progress.progress(
+            i / max(len(dates), 1),
+            text=f"{label}：第 {i+1}/{len(dates)} 日｜候選篩選 → 批次交通 → OR-Tools {day}",
         )
 
-        # 再合併案家資料並進入派單
+        day_tasks = tasks_for_ai[
+            pd.to_datetime(tasks_for_ai["日期"], errors="coerce").dt.date == day
+        ].copy()
 
-        tasks = merge_task_client_tables(df_tasks, df_cl)
+        if day_tasks.empty:
+            continue
 
-        # 批次內逐日產生候選；避免重複評分與跨日期負荷混算。
-        df_matches = pd.DataFrame() if (has_date_column and schedule_mode == '期間逐日排程') else run_phase1_matching(tasks, df_cg, config)
+        matches = run_phase1_matching(day_tasks, caregivers, cfg)
+        phase = run_phase2_optimization(matches, day_tasks, caregivers, cfg)
 
-        if has_date_column and schedule_mode == "期間逐日排程":
+        if not phase["df_result"].empty:
+            day_result = phase["df_result"].copy()
+            day_result["排班日期"] = day
+            frames.append(day_result)
 
-            dispatch_progress = st.progress(0.0, text='準備逐日排班…')
-            def update_dispatch_progress(done, total, day):
-                dispatch_progress.progress(done / max(total, 1), text=f'已完成 {done}/{total} 日' + (f'；正在計算 {day}' if day is not None else ''))
-            batch = run_monthly_batch_dispatch(tasks, df_cg, config, date_column="日期", progress_callback=update_dispatch_progress)
-            df_matches=batch['df_matches_all']
-            df_matches.attrs['matching_diagnostics']=batch['matching_diagnostics']
+        if not matches.empty:
+            match_frames.append(matches)
 
-            failed_dates = [
+        diagnostics.extend(matches.attrs.get("matching_diagnostics", []))
 
-                d for d, r in batch["daily_results"].items() if r["status"] not in (pywraplp.Solver.OPTIMAL,pywraplp.Solver.FEASIBLE) and not r["df_valid"].empty
+    progress.progress(1.0, text=f"{label}完成")
 
-            ]
-
-            phase2 = {
-
-                "df_valid": pd.DataFrame(),
-
-                "status": (pywraplp.Solver.FEASIBLE if any(r['status']==pywraplp.Solver.FEASIBLE for r in batch['daily_results'].values())
-                           else pywraplp.Solver.OPTIMAL) if not failed_dates else None,
-
-                "df_result": batch["df_result_all"],
-
-                "assigned_count": batch["total_assigned_count"],
-
-            }
-
-        else:
-
-            phase2 = run_phase2_optimization(df_matches, tasks, df_cg, config)
-
-            failed_dates = []
-
-        did = run_phase3_did(df_hist)
-        if not did.get('available',False):
-            st.info(did.get('reason','歷史資料不足，效益評估暫不計算'))
-
-    except Exception as e:
-
-        st.error(
-
-            "⚠️ 派單運算過程發生錯誤，請確認表格中的 ID 對應是否存在、數值欄位是否填寫正確"
-
-            f"（例如經緯度、工時、時間格式「HH:MM」）。錯誤訊息：{e}"
-
-        )
-
-        st.stop()
-
-    st.session_state["last_result"] = {
-        'input_signature':_live_signature,
-        "df_tasks": df_tasks,
-
-        "df_cg": df_cg,
-
-        "df_cl": df_cl,
-
-        "df_matches": df_matches,
-
-        "phase2": phase2,
-
-        "did": did,
-
-        "schedule_failed_dates": failed_dates,
-
+    return {
+        "df_result": pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(),
+        "df_matches": pd.concat(match_frames, ignore_index=True) if match_frames else pd.DataFrame(),
+        "diagnostics": diagnostics,
     }
 
-    # 每次重新執行最佳化後，AI 建議已改變，先前的居督覆寫不再對應同一份建議，故一併清空。
+if not has_date_column:
+    st.info("目前任務沒有日期欄位，使用一般 AI 派單。")
 
-    st.session_state["overrides"] = {}
-    new_dispatch_completed = True
+    if st.button("開始 AI 排班", type="primary", width="stretch"):
+        begin_travel_query_run(google_query_limit)
+
+        df_cg = st.session_state["edit_cg"].copy()
+        df_cl = st.session_state["edit_cl"].copy()
+        df_hist = st.session_state["data_hist"].copy()
+        df_tasks = st.session_state["edit_tasks"].copy()
+        df_service_code = st.session_state["edit_service_code"].copy()
+
+        try:
+            df_tasks = apply_service_duration(df_tasks, df_service_code)
+            tasks = merge_task_client_tables(df_tasks, df_cl)
+            df_matches = run_phase1_matching(tasks, df_cg, config)
+            phase2 = run_phase2_optimization(df_matches, tasks, df_cg, config)
+            did = run_phase3_did(df_hist)
+        except Exception as e:
+            st.error(f"⚠️ 派單運算過程發生錯誤：{e}")
+            st.stop()
+
+        st.session_state["last_result"] = {
+            "input_signature": _live_signature,
+            "df_tasks": df_tasks,
+            "df_tasks_all": df_tasks.copy(),
+            "df_cg": df_cg,
+            "df_cl": df_cl,
+            "df_matches": df_matches,
+            "phase2": phase2,
+            "did": did,
+            "schedule_failed_dates": [],
+            "weekly_workflow": False,
+        }
+        st.session_state["overrides"] = {}
+        new_dispatch_completed = True
+
+else:
+    all_dates_preview = pd.to_datetime(
+        _tasks_preview_df["日期"], errors="coerce"
+    ).dropna()
+
+    if all_dates_preview.empty:
+        st.warning("目前沒有有效日期可排班。")
+
+    else:
+        range_start = pd.Timestamp(
+            st.session_state.get(
+                "agency_range_start",
+                all_dates_preview.min(),
+            )
+        ).date()
+
+        range_end = pd.Timestamp(
+            st.session_state.get(
+                "agency_range_end",
+                all_dates_preview.max(),
+            )
+        ).date()
+
+        week_start = range_start
+        week_end = min(
+            week_start + pd.Timedelta(days=6),
+            range_end,
+        )
+
+        st.markdown("### 第一週排班草案")
+        st.caption(
+            "AI 完整計算只跑第一週 7 天。"
+            "確認第一週後，後續固定服務直接沿用；"
+            "第一週沒出現、之後才第一次出現的隔週／新服務，"
+            "只在第一次出現時交給 AI 排一次。"
+        )
+
+        c1, c2, c3 = st.columns([1.45, 0.8, 1.0])
+
+        with c1:
+            st.markdown("**AI 完整排班**")
+            st.markdown(
+                f"<div style='font-size:1.45rem; font-weight:600; white-space:nowrap;'>"
+                f"{week_start} ～ {week_end}"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+
+        with c2:
+            st.markdown("**基準週期**")
+            st.markdown(
+                "<div style='font-size:1.45rem; font-weight:600;'>7 天</div>",
+                unsafe_allow_html=True,
+            )
+
+        with c3:
+            st.markdown("**規劃延展至**")
+            st.markdown(
+                f"<div style='font-size:1.45rem; font-weight:600; white-space:nowrap;'>"
+                f"{range_end}"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+
+        st.info(
+            "隔週服務不需要先完整排兩週："
+            "如果某隔週案第一週沒有任務，等它第二週第一次出現時，"
+            "系統只排那個新出現的服務；排到人後，下一個隔週週期直接沿用。"
+        )
+
+        if st.button(
+            "開始排班 · 第一週",
+            type="primary",
+            width="stretch",
+            key="run_first_week_ai",
+        ):
+            begin_travel_query_run(google_query_limit)
+
+            df_cg = st.session_state["edit_cg"].copy()
+            df_cl = st.session_state["edit_cl"].copy()
+            df_hist = st.session_state["data_hist"].copy()
+            df_tasks_all = st.session_state["edit_tasks"].copy()
+            df_service_code = st.session_state["edit_service_code"].copy()
+
+            try:
+                df_tasks_all = apply_service_duration(
+                    df_tasks_all,
+                    df_service_code,
+                )
+
+                all_merged = merge_task_client_tables(
+                    df_tasks_all,
+                    df_cl,
+                )
+
+                date_norm = pd.to_datetime(
+                    all_merged["日期"],
+                    errors="coerce",
+                ).dt.date
+
+                first_week_tasks = all_merged[
+                    (date_norm >= week_start)
+                    & (date_norm <= week_end)
+                ].copy()
+
+                if first_week_tasks.empty:
+                    raise ValueError("第一週沒有可排任務。")
+
+                first_week_ai = _run_ai_by_day(
+                    first_week_tasks,
+                    df_cg,
+                    config,
+                    "AI 排第一週",
+                )
+
+                df_matches = first_week_ai["df_matches"]
+                df_matches.attrs["matching_diagnostics"] = (
+                    first_week_ai["diagnostics"]
+                )
+
+                first_week_result = first_week_ai["df_result"]
+
+                first_week_routes = pd.DataFrame()
+                if not first_week_result.empty:
+                    try:
+                        first_week_routes = calculate_schedule_travel(
+                            first_week_result,
+                            first_week_tasks,
+                            df_cg,
+                            config,
+                        )
+                    except Exception:
+                        first_week_routes = pd.DataFrame()
+
+                phase2 = {
+                    "df_valid": pd.DataFrame(),
+                    "status": pywraplp.Solver.OPTIMAL,
+                    "df_result": first_week_result,
+                    "assigned_count": len(first_week_result),
+                }
+
+                did = run_phase3_did(df_hist)
+
+            except Exception as e:
+                st.error(f"⚠️ 第一週排班失敗：{e}")
+                st.stop()
+
+            all_task_date = pd.to_datetime(
+                df_tasks_all["日期"],
+                errors="coerce",
+            ).dt.date
+
+            st.session_state["last_result"] = {
+                "input_signature": _live_signature,
+                "df_tasks": df_tasks_all[
+                    (all_task_date >= week_start)
+                    & (all_task_date <= week_end)
+                ].copy(),
+                "df_tasks_all": df_tasks_all.copy(),
+                "df_cg": df_cg,
+                "df_cl": df_cl,
+                "df_matches": df_matches,
+                "phase2": phase2,
+                "did": did,
+                "schedule_failed_dates": [],
+                "weekly_workflow": True,
+                "week_start": week_start,
+                "week_end": week_end,
+                "range_end": range_end,
+                "route_result": first_week_routes,
+                "extended_to_end": False,
+            }
+
+            st.session_state["overrides"] = {}
+            st.session_state.pop(
+                "confirmed_week_baseline",
+                None,
+            )
+            st.session_state.pop(
+                "extension_summary",
+                None,
+            )
+            new_dispatch_completed = True
+            st.rerun()
+
 
 if "last_result" in st.session_state:
 
@@ -974,7 +1218,202 @@ if "last_result" in st.session_state:
 
         overrides[task_id] = {"cg_id": new_cg_id, "reason": reason}
 
+        if (
+            new_cg_id is not None
+            and st.session_state.get("override_apply_scope", "僅本次") == "後續同週期服務"
+        ):
+            st.session_state["last_override_propagation"] = _propagate_recurring_override(
+                task_id, new_cg_id, reason
+            )
+        else:
+            st.session_state.pop("last_override_propagation", None)
+
         return None
+
+
+    def _propagate_recurring_override(source_task_id, preferred_cg_id, base_reason):
+        source_rows = df_tasks[df_tasks["任務ID"].astype(str) == str(source_task_id)]
+        if source_rows.empty:
+            return {
+                "source_task_id": source_task_id,
+                "preferred_cg_id": preferred_cg_id,
+                "updated": 0,
+                "replanned": 0,
+                "unassigned": 0,
+                "details": [],
+            }
+
+        source = source_rows.iloc[0]
+        source_date = pd.to_datetime(source.get("日期"), errors="coerce")
+
+        def _recurrence_key(row):
+            src = row.get("來源列")
+            if pd.notna(src) and str(src).strip() not in ("", "nan", "None"):
+                return ("來源列", str(src).strip())
+            task_id = str(row.get("任務ID", ""))
+            return ("任務ID", re.sub(r"_\d{8}$", "", task_id))
+
+        source_key = _recurrence_key(source)
+
+        future_rows = []
+        for _, row in df_tasks.iterrows():
+            if _recurrence_key(row) != source_key:
+                continue
+            row_date = pd.to_datetime(row.get("日期"), errors="coerce")
+            if pd.isna(row_date) or pd.isna(source_date) or row_date <= source_date:
+                continue
+            future_rows.append(row)
+
+        future_rows.sort(
+            key=lambda r: (
+                pd.to_datetime(r.get("日期"), errors="coerce"),
+                str(r.get("時間窗_開始", "")),
+            )
+        )
+
+        updated = 0
+        replanned = 0
+        unassigned = 0
+        details = []
+
+        _tasks_merged = merge_task_client_tables(
+            df_tasks, res.get("df_cl", pd.DataFrame())
+        )
+        _merged_lookup = {
+            str(r["任務ID"]): r
+            for _, r in _tasks_merged.iterrows()
+        }
+
+        for row in future_rows:
+            target_id = str(row["任務ID"])
+            effective_now = apply_overrides_to_result(df_result, overrides)
+
+            conflict_msg = check_reassignment_conflict(
+                target_id,
+                preferred_cg_id,
+                df_tasks,
+                effective_now,
+                res.get("df_cg", pd.DataFrame()),
+                config,
+                task_locations=task_locations,
+                date_column="日期",
+                df_cl=res.get("df_cl", pd.DataFrame()),
+            )
+
+            if not conflict_msg:
+                propagate_reason = f"固定班調整延續：{base_reason}"
+                target_client = row.get("案家ID", "")
+                old_cg = assigned_map.get(target_id, "未指派")
+                save_override_log(
+                    target_id,
+                    target_client,
+                    old_cg,
+                    preferred_cg_id,
+                    propagate_reason,
+                )
+                overrides[target_id] = {
+                    "cg_id": preferred_cg_id,
+                    "reason": propagate_reason,
+                }
+                updated += 1
+                details.append({
+                    "任務ID": target_id,
+                    "日期": row.get("日期"),
+                    "結果": "沿用新居服員",
+                    "居服員": preferred_cg_id,
+                    "備註": "",
+                })
+                continue
+
+            pending_result = effective_now[
+                effective_now["任務ID"].astype(str) != target_id
+            ].copy()
+
+            task_for_insert = _merged_lookup.get(target_id)
+            candidate_df = pd.DataFrame()
+            if task_for_insert is not None:
+                try:
+                    candidate_df = find_insertion_candidates(
+                        task_for_insert,
+                        _tasks_merged,
+                        pending_result,
+                        res.get("df_cg", pd.DataFrame()),
+                        config,
+                        top_n=3,
+                        date_column="日期",
+                    )
+                except Exception:
+                    candidate_df = pd.DataFrame()
+
+            available_df = (
+                candidate_df[candidate_df["可直接插入"] == True].copy()
+                if not candidate_df.empty and "可直接插入" in candidate_df.columns
+                else pd.DataFrame()
+            )
+
+            if not available_df.empty:
+                fallback_cg = str(available_df.iloc[0]["居服員ID"])
+                fallback_reason = (
+                    f"固定班調整延續｜原指定 {preferred_cg_id} 該週不可行，"
+                    f"系統自動重排：{base_reason}"
+                )
+                target_client = row.get("案家ID", "")
+                old_cg = assigned_map.get(target_id, "未指派")
+                save_override_log(
+                    target_id,
+                    target_client,
+                    old_cg,
+                    fallback_cg,
+                    fallback_reason,
+                )
+                overrides[target_id] = {
+                    "cg_id": fallback_cg,
+                    "reason": fallback_reason,
+                }
+                replanned += 1
+                details.append({
+                    "任務ID": target_id,
+                    "日期": row.get("日期"),
+                    "結果": "AI重新找人",
+                    "居服員": fallback_cg,
+                    "備註": str(conflict_msg),
+                })
+            else:
+                unresolved_reason = (
+                    f"固定班調整延續｜{preferred_cg_id} 該週不可行且無可直接插入候選："
+                    f"{base_reason}"
+                )
+                target_client = row.get("案家ID", "")
+                old_cg = assigned_map.get(target_id, "未指派")
+                save_override_log(
+                    target_id,
+                    target_client,
+                    old_cg,
+                    "未指派",
+                    unresolved_reason,
+                )
+                overrides[target_id] = {
+                    "cg_id": None,
+                    "reason": unresolved_reason,
+                }
+                unassigned += 1
+                details.append({
+                    "任務ID": target_id,
+                    "日期": row.get("日期"),
+                    "結果": "待人工處理",
+                    "居服員": "未指派",
+                    "備註": str(conflict_msg),
+                })
+
+        return {
+            "source_task_id": source_task_id,
+            "preferred_cg_id": preferred_cg_id,
+            "updated": updated,
+            "replanned": replanned,
+            "unassigned": unassigned,
+            "details": details,
+        }
+
 
     def _clear_override(task_id):
 
@@ -1020,6 +1459,603 @@ if "last_result" in st.session_state:
 
         )
 
+
+    def _calendar_move(draft, reason, scope):
+        """Preview confirmation: validate first, then change a single task atomically."""
+        task_id = str(draft.get("task_id", ""))
+        new_cg = str(draft.get("cg_id", ""))
+        found = df_tasks["任務ID"].astype(str).eq(task_id)
+        if found.sum() != 1:
+            return "找不到唯一的服務任務。"
+        old = df_tasks.loc[found].iloc[0]
+        try:
+            new_day = pd.Timestamp(draft["date"]).date()
+            first = datetime.strptime(draft["start"], "%H:%M")
+            last = datetime.strptime(draft["end"], "%H:%M")
+        except (KeyError, TypeError, ValueError):
+            return "日期或時段格式不正確。"
+        old_start = pd.to_datetime(old.get("時間窗_開始"), errors="coerce")
+        old_end = pd.to_datetime(old.get("時間窗_結束"), errors="coerce")
+        if pd.isna(old_start) or pd.isna(old_end):
+            return "原服務時段無法辨識，請改用人工改派。"
+        if (last - first).total_seconds() != (old_end - old_start).total_seconds():
+            return "拖曳須維持原服務分鐘，請重新操作。"
+        if first.time() < pd.Timestamp("08:00").time() or last.time() > pd.Timestamp("21:00").time() or first >= last:
+            return "服務須在 08:00–21:00 內，且結束時間晚於開始。"
+        original_day = pd.to_datetime(old.get("日期"), errors="coerce")
+        if pd.isna(original_day):
+            return "原服務日期無法辨識。"
+        allowed_dates = pd.to_datetime(df_tasks["日期"], errors="coerce").dropna().dt.date
+        if allowed_dates.empty or not allowed_dates.min() <= new_day <= allowed_dates.max():
+            return "新日期須在目前已產生的班表期間內。"
+        time_changed = (new_day != original_day.date() or draft["start"] != str(old["時間窗_開始"])[:5])
+        if time_changed and scope != "僅本次":
+            return "調整日期或時段時，請選『僅本次』。"
+        if not time_changed:
+            st.session_state["override_apply_scope"] = scope
+            return _quick_reassign(task_id, new_cg, reason)
+        proposed = df_tasks.copy()
+        proposed.loc[found, "日期"] = new_day.isoformat()
+        proposed.loc[found, "時間窗_開始"] = draft["start"]
+        proposed.loc[found, "時間窗_結束"] = draft["end"]
+        proposed.loc[found, "星期"] = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"][new_day.weekday()]
+        effective = apply_overrides_to_result(df_result, overrides)
+        try:
+            conflict = check_reassignment_conflict(
+                task_id, new_cg, proposed, effective, res.get("df_cg", pd.DataFrame()),
+                config, task_locations=task_locations, date_column="日期", df_cl=res.get("df_cl"),
+            )
+        except Exception as exc:
+            return "無法完成衝突檢查：" + str(exc)
+        if conflict:
+            return conflict
+        old_cg = effective.loc[effective["任務ID"].astype(str).eq(task_id), "派單居服員"]
+        old_label = str(old_cg.iloc[0]) if not old_cg.empty else "未指派"
+        try:
+            save_override_log(task_id, old.get("案家ID", ""), old_label, new_cg,
+                              f"{reason}｜時段 {original_day.date()} {old['時間窗_開始']}-{old['時間窗_結束']} → {new_day} {draft['start']}-{draft['end']}")
+        except Exception as exc:
+            return "寫入改班紀錄失敗：" + str(exc)
+        res["df_tasks"] = proposed
+        if "df_tasks_all" in res:
+            all_tasks = res["df_tasks_all"].copy()
+            all_mask = all_tasks["任務ID"].astype(str).eq(task_id)
+            for col in ("日期", "時間窗_開始", "時間窗_結束", "星期"):
+                if col in all_tasks:
+                    all_tasks.loc[all_mask, col] = proposed.loc[found, col].iloc[0]
+            res["df_tasks_all"] = all_tasks
+        overrides[task_id] = {"cg_id": new_cg, "reason": reason}
+        result_mask = phase2["df_result"]["任務ID"].astype(str).eq(task_id)
+        if result_mask.any():
+            if "服務時段" in phase2["df_result"]:
+                phase2["df_result"].loc[result_mask, "服務時段"] = draft["start"] + "-" + draft["end"]
+            if "排班日期" in phase2["df_result"]:
+                phase2["df_result"].loc[result_mask, "排班日期"] = new_day
+        res.pop("route_signature", None)
+        res.pop("google_verified_signature", None)
+        return None
+
+    if res.get("weekly_workflow"):
+        st.markdown("### ② 第一週確認與延展")
+
+        effective_first_week = apply_overrides_to_result(
+            df_result,
+            overrides,
+        )
+
+        saved_week_start = pd.Timestamp(
+            res.get("week_start")
+        ).date()
+        saved_week_end = pd.Timestamp(
+            res.get("week_end")
+        ).date()
+        saved_range_end = pd.Timestamp(
+            res.get("range_end")
+        ).date()
+
+        confirm_col, extend_col = st.columns(2)
+
+        if confirm_col.button(
+            "✅ 確認第一週為基準班表",
+            type="secondary",
+            key="confirm_first_week_baseline",
+            width="stretch",
+        ):
+            baseline = _build_baseline_map(
+                effective_first_week
+            )
+
+            st.session_state[
+                "confirmed_week_baseline"
+            ] = baseline
+
+            st.success(
+                f"第一週已確認：{len(baseline)} 個固定服務配對。"
+            )
+
+        baseline = st.session_state.get(
+            "confirmed_week_baseline",
+            {},
+        )
+
+        if baseline:
+            st.caption(
+                f"目前已有 {len(baseline)} 個固定配對。"
+                "後續相同週期直接沿用；"
+                "第一週沒出現的新週期服務，首次出現時才 AI 排一次。"
+            )
+
+        can_extend = (
+            bool(baseline)
+            and saved_week_end < saved_range_end
+        )
+
+        if not baseline:
+            st.caption("請先確認第一週基準班表，右側「延展至規劃結束日」才會解鎖。")
+
+        if extend_col.button(
+            "📅 延展至規劃結束日",
+            type="secondary",
+            key="extend_to_range_end",
+            width="stretch",
+            disabled=not can_extend,
+        ):
+            all_tasks_raw = res.get(
+                "df_tasks_all",
+                df_tasks,
+            ).copy()
+
+            all_tasks = apply_service_duration(
+                all_tasks_raw,
+                st.session_state[
+                    "edit_service_code"
+                ].copy(),
+            )
+
+            all_merged = merge_task_client_tables(
+                all_tasks,
+                res["df_cl"],
+            )
+
+            future_date = pd.to_datetime(
+                all_merged["日期"],
+                errors="coerce",
+            ).dt.date
+
+            future = all_merged[
+                (future_date > saved_week_end)
+                & (future_date <= saved_range_end)
+            ].copy()
+
+            baseline_work = dict(baseline)
+
+            result_frames = [
+                effective_first_week.copy()
+            ]
+            match_frames = []
+
+            direct_count = 0
+            first_seen_ai_count = 0
+            exception_ai_count = 0
+            unassigned_count = 0
+
+            cg_df = res.get(
+                "df_cg",
+                pd.DataFrame(),
+            ).copy()
+
+            cg_lookup = (
+                cg_df
+                .set_index("居服員ID")
+                .to_dict("index")
+                if not cg_df.empty
+                and "居服員ID" in cg_df.columns
+                else {}
+            )
+
+            future_dates = sorted(
+                pd.to_datetime(
+                    future["日期"],
+                    errors="coerce",
+                )
+                .dropna()
+                .dt.date
+                .unique()
+            )
+
+            progress = st.progress(
+                0.0,
+                text="正在延展固定班表…",
+            )
+
+            for i, day in enumerate(future_dates):
+                progress.progress(
+                    i / max(
+                        len(future_dates),
+                        1,
+                    ),
+                    text=(
+                        f"延展 {i}/{len(future_dates)} 日；"
+                        f"正在處理 {day}"
+                    ),
+                )
+
+                day_tasks = future[
+                    pd.to_datetime(
+                        future["日期"],
+                        errors="coerce",
+                    ).dt.date == day
+                ].copy()
+
+                if day_tasks.empty:
+                    continue
+
+                carried_pairs = []
+                pending_rows = []
+
+                # 標記：這筆 pending 是「第一次出現的新週期」還是「既有固定班例外」
+                pending_reason_by_task = {}
+
+                busy = {}
+                hours = {}
+
+                for _, task in day_tasks.sort_values(
+                    ["時間窗_開始", "任務ID"],
+                    kind="stable",
+                ).iterrows():
+                    task_id = str(
+                        task["任務ID"]
+                    )
+                    task_key = _weekly_task_key(
+                        task
+                    )
+                    cg_id = baseline_work.get(
+                        task_key
+                    )
+
+                    # 第一週沒出現的隔週/新週期
+                    if not cg_id:
+                        pending_rows.append(
+                            task.to_dict()
+                        )
+                        pending_reason_by_task[
+                            task_id
+                        ] = "first_seen"
+                        continue
+
+                    cg = cg_lookup.get(
+                        cg_id
+                    )
+
+                    if cg is None:
+                        pending_rows.append(
+                            task.to_dict()
+                        )
+                        pending_reason_by_task[
+                            task_id
+                        ] = "exception"
+                        continue
+
+                    reason = _check_hard_constraints(
+                        task,
+                        pd.Series(cg),
+                        config,
+                        None,
+                        True,
+                    )
+
+                    try:
+                        start_t = datetime.strptime(
+                            str(
+                                task[
+                                    "時間窗_開始"
+                                ]
+                            ).strip(),
+                            "%H:%M",
+                        )
+                        end_t = datetime.strptime(
+                            str(
+                                task[
+                                    "時間窗_結束"
+                                ]
+                            ).strip(),
+                            "%H:%M",
+                        )
+                    except Exception:
+                        reason = (
+                            reason
+                            or "服務時段無法解析"
+                        )
+
+                    if not reason:
+                        overlap = any(
+                            start_t < old_end
+                            and end_t > old_start
+                            for (
+                                old_start,
+                                old_end,
+                                _,
+                                _,
+                            ) in busy.get(
+                                cg_id,
+                                [],
+                            )
+                        )
+                        if overlap:
+                            reason = (
+                                "與已延展班表時段重疊"
+                            )
+
+                    duration_hr = float(
+                        task.get(
+                            "服務歷時(分鐘)",
+                            0,
+                        )
+                        or 0
+                    ) / 60.0
+
+                    after_hr = (
+                        hours.get(
+                            cg_id,
+                            0.0,
+                        )
+                        + duration_hr
+                    )
+
+                    cap = cg.get(
+                        "每日工時上限(小時)"
+                    )
+
+                    if (
+                        not reason
+                        and pd.notna(cap)
+                        and after_hr > float(cap)
+                    ):
+                        reason = (
+                            "延展後每日工時超過上限"
+                        )
+
+                    if reason:
+                        pending_rows.append(
+                            task.to_dict()
+                        )
+                        pending_reason_by_task[
+                            task_id
+                        ] = "exception"
+                        continue
+
+                    carried_pairs.append(
+                        (task_id, cg_id)
+                    )
+
+                    busy.setdefault(
+                        cg_id,
+                        [],
+                    ).append(
+                        (
+                            start_t,
+                            end_t,
+                            task.get(
+                                "服務地點_緯度"
+                            ),
+                            task.get(
+                                "服務地點_經度"
+                            ),
+                        )
+                    )
+
+                    hours[cg_id] = after_hr
+
+                carried_df = _make_carried_rows(
+                    carried_pairs,
+                    day_tasks,
+                    config,
+                )
+
+                direct_count += len(
+                    carried_df
+                )
+
+                pending = pd.DataFrame(
+                    pending_rows
+                )
+
+                if not pending.empty:
+                    matches = run_phase1_matching(
+                        pending,
+                        cg_df,
+                        config,
+                    )
+
+                    try:
+                        phase = run_phase2_optimization(
+                            matches,
+                            pending,
+                            cg_df,
+                            config,
+                            extra_busy_blocks=busy,
+                        )
+                    except TypeError:
+                        phase = run_phase2_optimization(
+                            matches,
+                            pending,
+                            cg_df,
+                            config,
+                        )
+
+                    ai_df = phase[
+                        "df_result"
+                    ].copy()
+
+                    assigned_ids = set(
+                        ai_df["任務ID"]
+                        .astype(str)
+                        .tolist()
+                    ) if not ai_df.empty else set()
+
+                    for pending_task_id, why in pending_reason_by_task.items():
+                        if pending_task_id in assigned_ids:
+                            if why == "first_seen":
+                                first_seen_ai_count += 1
+                            else:
+                                exception_ai_count += 1
+
+                    unassigned_count += max(
+                        len(pending)
+                        - len(ai_df),
+                        0,
+                    )
+
+                    if not matches.empty:
+                        match_frames.append(
+                            matches
+                        )
+
+                    # 關鍵：
+                    # 只有「第一次出現的新週期」成功排到人後，才建立新的固定配對。
+                    # 既有固定班因單次請假/衝突改派，不會覆蓋原本 baseline。
+                    pending_lookup = (
+                        pending
+                        .set_index("任務ID")
+                        .to_dict("index")
+                    )
+
+                    for _, ai_row in ai_df.iterrows():
+                        ai_task_id = str(
+                            ai_row["任務ID"]
+                        )
+
+                        if (
+                            pending_reason_by_task.get(
+                                ai_task_id
+                            )
+                            != "first_seen"
+                        ):
+                            continue
+
+                        task_dict = pending_lookup.get(
+                            ai_task_id,
+                            {
+                                "任務ID": ai_task_id
+                            },
+                        )
+
+                        new_key = _weekly_task_key(
+                            task_dict
+                        )
+
+                        baseline_work[
+                            new_key
+                        ] = str(
+                            ai_row[
+                                "派單居服員"
+                            ]
+                        )
+
+                    day_result = pd.concat(
+                        [
+                            carried_df,
+                            ai_df,
+                        ],
+                        ignore_index=True,
+                        sort=False,
+                    )
+
+                else:
+                    day_result = carried_df
+
+                if not day_result.empty:
+                    day_result[
+                        "排班日期"
+                    ] = day
+                    result_frames.append(
+                        day_result
+                    )
+
+            progress.progress(
+                1.0,
+                text="延展完成",
+            )
+
+            full_result = pd.concat(
+                result_frames,
+                ignore_index=True,
+                sort=False,
+            )
+
+            full_matches = (
+                pd.concat(
+                    match_frames,
+                    ignore_index=True,
+                    sort=False,
+                )
+                if match_frames
+                else pd.DataFrame()
+            )
+
+            full_matches.attrs['matching_diagnostics'] = [
+                entry for frame in match_frames for entry in frame.attrs.get('matching_diagnostics', [])
+            ]
+
+            res["phase2"][
+                "df_result"
+            ] = full_result
+            res["phase2"][
+                "assigned_count"
+            ] = len(full_result)
+            res["phase2"][
+                "status"
+            ] = pywraplp.Solver.OPTIMAL
+
+            res["df_tasks"] = (
+                all_tasks.copy()
+            )
+            res["df_matches"] = (
+                full_matches
+            )
+            res[
+                "extended_to_end"
+            ] = True
+            res[
+                "route_result"
+            ] = pd.DataFrame()
+            res[
+                "route_signature"
+            ] = None
+
+            st.session_state[
+                "confirmed_week_baseline"
+            ] = baseline_work
+
+            st.session_state[
+                "extension_summary"
+            ] = {
+                "直接延展": direct_count,
+                "首次出現AI": first_seen_ai_count,
+                "例外AI": exception_ai_count,
+                "未派": unassigned_count,
+            }
+
+            st.rerun()
+
+        summary = st.session_state.get(
+            "extension_summary"
+        )
+
+        if (
+            summary
+            and res.get(
+                "extended_to_end"
+            )
+        ):
+            st.success(
+                "📅 已延展至規劃結束日｜"
+                f"固定班直接沿用 {summary['直接延展']} 筆｜"
+                f"隔週／新週期首次 AI {summary['首次出現AI']} 筆｜"
+                f"例外重新 AI {summary['例外AI']} 筆｜"
+                f"未派 {summary['未派']} 筆"
+            )
+
     if not solver_ok:
 
         if schedule_failed_dates:
@@ -1037,48 +2073,95 @@ if "last_result" in st.session_state:
             st.warning("OR-Tools 無法在目前資料與參數下找到最佳解，請檢查資料是否有效或調整參數。")
 
     travel_tasks = merge_task_client_tables(df_tasks, res['df_cl'])
-    # 人工改派、取消及新增派單後，依有效班表重新計算前後路段。
     route_signature = repr(sorted((str(k),repr(v)) for k,v in overrides.items()))
-    if res.get('route_signature') != route_signature or 'route_result' not in res:
-        try:
-            res['route_result'] = calculate_schedule_travel(apply_overrides_to_result(df_result, overrides), travel_tasks, res['df_cg'], config)
-            res['route_signature'] = route_signature
-            res.pop('google_verified_signature', None)
-        except Exception as exc:
-            st.error('交通查詢失敗：' + str(exc))
-            st.stop()
-    # 僅新排班成功時自動核對一次；滑桿、改派及其他頁面重跑不自動查 Google。
-    if new_dispatch_completed and google_auto_verify and provider == 'hybrid' and solver_ok and not df_result.empty:
-        effective_routes = apply_overrides_to_result(df_result, overrides)
-        transit_ids = set(res['df_cg'].loc[res['df_cg']['常用交通工具'].eq('大眾運輸'), '居服員ID'])
-        if effective_routes['派單居服員'].isin(transit_ids).any():
+
+    if res.get("weekly_workflow") and res.get("extended_to_end"):
+        st.markdown("### ③ 完整月份交通（需要時再算）")
+        st.info(
+            "第一週排班時已依交通工具計算交通：機車走 OSRM、大眾運輸走 Google。"
+            "後續固定班延展為了速度不會自動重算整月交通；"
+            "若要查看完整月份交通 KPI／逐段路線，再按下方按鈕。"
+        )
+
+        if st.button(
+            "🛣️ 計算完整月份交通",
+            key="calc_full_month_travel",
+        ):
             try:
-                res['route_result'] = verify_schedule_google_travel(effective_routes, travel_tasks, res['df_cg'], config, google_query_limit)
-                res['google_verified_signature'] = route_signature
-            except Exception as exc:
-                st.warning('公車／捷運 Google 核對未完成，已保留草案，不自動重試：' + str(exc))
-    df_route_result = res['route_result'].copy()
-    daily_travel = summarize_schedule_travel(df_route_result)
-    if st.session_state.get('careflow_travel_provider') in ('hybrid','google'):
-        checked = res.get('google_verified_signature') == route_signature
-        st.caption('已使用 Google 核對路段。' if checked else '草案已產生，交通尚未完成 Google 核對；公車／捷運先顯示本機概算，機車依選定來源估算。')
-        if st.button('使用 Google 核對已排班交通（可能計費）', disabled=not solver_ok or df_result.empty or checked, key='verify_google_schedule'):
-            try:
-                verified = verify_schedule_google_travel(apply_overrides_to_result(df_result, overrides), travel_tasks, res['df_cg'], config, google_query_limit)
-                res['route_result'] = verified
-                res['google_verified_signature'] = route_signature
+                res["route_result"] = calculate_schedule_travel(
+                    apply_overrides_to_result(
+                        df_result,
+                        overrides,
+                    ),
+                    travel_tasks,
+                    res["df_cg"],
+                    config,
+                )
+                res["route_signature"] = route_signature
+                res.pop(
+                    "google_verified_signature",
+                    None,
+                )
                 st.rerun()
             except Exception as exc:
-                st.error('Google 核對未完成，草案仍保留：' + str(exc))
-        if checked and '轉場時段檢查' in df_route_result and df_route_result['轉場時段檢查'].eq('轉場時間不足，需調班').any():
-            st.warning('Google 核對後發現轉場時間不足，請依路段明細調班；本次核對不會自動重新派單。')
+                st.error(
+                    "交通查詢失敗："
+                    + str(exc)
+                )
 
-    total_tasks = len(df_tasks)
+        elif "route_result" not in res:
+            res["route_result"] = pd.DataFrame()
 
+    else:
+        if (
+            res.get("route_signature")
+            != route_signature
+            or "route_result" not in res
+        ):
+            try:
+                res["route_result"] = calculate_schedule_travel(
+                    apply_overrides_to_result(
+                        df_result,
+                        overrides,
+                    ),
+                    travel_tasks,
+                    res["df_cg"],
+                    config,
+                )
+                res[
+                    "route_signature"
+                ] = route_signature
+                res.pop(
+                    "google_verified_signature",
+                    None,
+                )
+            except Exception as exc:
+                st.error(
+                    "交通查詢失敗："
+                    + str(exc)
+                )
+                st.stop()
+    df_route_result = res.get('route_result', pd.DataFrame()).copy()
+    _route_columns = ['任務ID', '交通日期', '派單居服員', '交通路段', '預估車程(分)',
+                      '路段緩衝(分)', '含緩衝交通時間(分)', '交通計算狀態']
+    df_route_result = df_route_result.reindex(columns=list(dict.fromkeys(list(df_route_result.columns) + _route_columns)))
+    df_route_result['預估車程(分)'] = pd.to_numeric(df_route_result['預估車程(分)'], errors='coerce')
+    daily_travel = summarize_schedule_travel(df_route_result)
+
+    _effective_for_kpi = apply_overrides_to_result(df_result, overrides)
+    _task_ids = set(df_tasks['任務ID'].dropna().astype(str))
+    if {'任務ID', '派單居服員'}.issubset(_effective_for_kpi.columns):
+        _valid_assignee = _effective_for_kpi['派單居服員'].notna() & ~_effective_for_kpi['派單居服員'].astype(str).str.strip().isin(['', '未指派', 'nan', 'None'])
+        _effective_for_kpi = _effective_for_kpi.loc[_valid_assignee & _effective_for_kpi['任務ID'].astype(str).isin(_task_ids)].drop_duplicates('任務ID', keep='last').copy()
+        _assigned_ids = set(_effective_for_kpi['任務ID'].astype(str))
+    else:
+        _assigned_ids = set()
+    assigned_count = len(_assigned_ids)
+    total_tasks = len(_task_ids)
     assign_rate = (assigned_count / total_tasks * 100) if total_tasks else 0.0
 
-    travel_complete = df_route_result.empty or df_route_result['預估車程(分)'].notna().all()
-    avg_transition = df_route_result['預估車程(分)'].mean() if not df_route_result.empty else 0.0
+    travel_complete = not df_route_result.empty and df_route_result['預估車程(分)'].notna().all()
+    avg_transition = df_route_result['預估車程(分)'].mean()
 
     avg_score = df_result["適配分數"].mean() if not df_result.empty else 0.0
 
@@ -1101,9 +2184,34 @@ if "last_result" in st.session_state:
 
     k1.metric("派單成功率", f"{assign_rate:.1f}%", help=f"{assigned_count} / {total_tasks} 筆任務成功指派")
 
-    k2.metric("平均每段交通時間", f"{avg_transition:.1f} 分" if travel_complete else "路段資料待補齊", help="依每位員工每天服務順序：服務起點→首案，前案→下一案。不含轉場緩衝及末案返家。")
+    k2.metric("平均每段交通時間", f"{avg_transition:.1f} 分" if travel_complete else ("尚未計算" if df_route_result.empty else "路段資料待補齊"), help="依每位員工每天服務順序：服務起點→首案，前案→下一案。不含轉場緩衝及末案返家。")
 
     k3.metric("平均適配得分", f"{avg_score:.1f} 分", help="已派單配對的平均適配度分數")
+
+    _scope_dates = pd.to_datetime(df_tasks.get('日期', pd.Series(dtype=object)), errors='coerce').dropna()
+    _scope_label = f"{_scope_dates.min():%Y-%m-%d} ～ {_scope_dates.max():%Y-%m-%d}" if not _scope_dates.empty else '目前任務'
+    st.caption(f"統計範圍：{_scope_label}｜已派 {assigned_count} 筆／共 {total_tasks} 筆｜未派 {total_tasks - assigned_count} 筆。已納入人工改派；未延展的未來日期不列入本次分母。")
+    if total_tasks > assigned_count:
+        with st.expander(f"查看 {total_tasks - assigned_count} 筆未派任務及診斷", expanded=False):
+            _pending_report = df_tasks.loc[~df_tasks['任務ID'].astype(str).isin(_assigned_ids)].drop_duplicates('任務ID').copy()
+            _diag_map = {str(d.get('任務ID')): d for d in diagnostics}
+            _candidate_counts = df_matches.groupby('任務ID')['居服員ID'].nunique().to_dict() if {'任務ID', '居服員ID'}.issubset(df_matches.columns) else {}
+            _candidate_counts = {str(k): v for k, v in _candidate_counts.items()}
+            def _pending_diagnosis(task_id):
+                item = _diag_map.get(str(task_id), {})
+                count = item.get('候選數', _candidate_counts.get(str(task_id)))
+                if str(task_id) in overrides and overrides[str(task_id)].get('cg_id') is None:
+                    return '人工改為未指派', count, overrides[str(task_id)].get('reason', '')
+                if count is None:
+                    return '缺少候選診斷，尚無法判定原因', None, ''
+                if count == 0:
+                    return '沒有通過配對條件的候選人', count, item.get('剔除原因', '')
+                return '有候選但未排入；需核對時段、交通、工時及求解限制', count, item.get('剔除原因', '')
+            _pending_report[['診斷', '候選數', '候選剔除明細']] = pd.DataFrame(
+                [_pending_diagnosis(t) for t in _pending_report['任務ID']], index=_pending_report.index)
+            _pending_columns = [c for c in ['日期','任務ID','案家ID','時間窗_開始','時間窗_結束','Service_Code_1','診斷','候選數','候選剔除明細'] if c in _pending_report]
+            show_table(_pending_report[_pending_columns], hide_index=True, width='stretch')
+            st.download_button('下載未派任務診斷 CSV', export_frame(_pending_report[_pending_columns]).to_csv(index=False).encode('utf-8-sig'), '未派任務診斷.csv', 'text/csv', key='download_pending_diagnostics')
 
     st.caption('交通依有效派單的每日服務順序計算；首案由員工家／服務起點出發，後續由前一案出發。交通與緩衝分開顯示；不含末案返家及未匯入的其他行程。')
     with st.expander('每日交通總時間與逐段路線', expanded=False):
@@ -1143,6 +2251,23 @@ if "last_result" in st.session_state:
 
     # on_list_candidates 供「月曆視角一鍵調班」（含空檔優先排序）使用。
 
+    # 全員每日總覽：包含無任務日，清楚區分計算範圍與班表檢視日期。
+    if '日期' in df_tasks and not df_tasks.empty:
+        _daily_tasks = df_tasks.drop_duplicates('任務ID').copy()
+        _daily_tasks['_day'] = pd.to_datetime(_daily_tasks['日期'], errors='coerce').dt.normalize()
+        _daily_tasks['_assigned'] = _daily_tasks['任務ID'].astype(str).isin(_assigned_ids).astype(int)
+        _period_start = pd.Timestamp(res.get('week_start') or _daily_tasks['_day'].min()).normalize()
+        _period_end = pd.Timestamp((res.get('range_end') if res.get('extended_to_end') else res.get('week_end')) or _daily_tasks['_day'].max()).normalize()
+        if pd.notna(_period_start) and pd.notna(_period_end):
+            _daily_summary = _daily_tasks.groupby('_day').agg(任務數=('任務ID','size'), 已派=('_assigned','sum'))
+            _daily_summary = _daily_summary.reindex(pd.date_range(_period_start, _period_end), fill_value=0)
+            _daily_summary['未派'] = _daily_summary['任務數'] - _daily_summary['已派']
+            _daily_summary.insert(0, '日期', _daily_summary.index.strftime('%m/%d'))
+            _daily_summary.insert(1, '星期', [['一','二','三','四','五','六','日'][d.weekday()] for d in _daily_summary.index])
+            st.markdown('### 全員每日排班總覽')
+            st.caption(f"已處理 {_period_start:%Y/%m/%d} ～ {_period_end:%Y/%m/%d}，共 {(_period_end-_period_start).days+1} 天；0 筆表示當天沒有匯入的服務任務。")
+            show_table(_daily_summary.reset_index(drop=True), hide_index=True, width='stretch')
+
     render_calendar_overview(
 
         df_result, df_tasks, res.get("df_cg", pd.DataFrame()),
@@ -1150,6 +2275,10 @@ if "last_result" in st.session_state:
         overrides=overrides,
 
         on_reassign=_quick_reassign, on_list_candidates=_list_candidates,
+        on_move=_calendar_move,
+        period_start=res.get('week_start'),
+        client_names=_client_names if _show_names else {},
+        caregiver_names=_caregiver_names if _show_names else {},
 
     )
 
@@ -1232,9 +2361,8 @@ if "last_result" in st.session_state:
         ax = axes[1, 1]
 
         if (
-            not df_result.empty
-            and "預估車程(分)" in df_result.columns
-            and "任務ID" in df_result.columns
+            not df_route_result.empty
+            and {"任務ID", "預估車程(分)"}.issubset(df_route_result.columns)
         ):
             _travel_plot = df_route_result[["任務ID", "預估車程(分)"]].copy()
             _travel_plot["預估車程(分)"] = pd.to_numeric(
@@ -1274,13 +2402,24 @@ if "last_result" in st.session_state:
 
     st.subheader("📋 指派明細表")
 
-    if df_result.empty:
+    if _effective_for_kpi.empty:
 
         st.info("目前無派單結果。")
 
     else:
 
-        df_display = df_route_result.copy()
+        # 派單明細從有效指派建立，交通未計算也能顯示與匯出。
+        df_display = _effective_for_kpi.copy()
+        _task_lookup = df_tasks.drop_duplicates('任務ID').set_index('任務ID')
+        for _col in ['案家ID', '任務優先級']:
+            if _col in _task_lookup:
+                _mapped = df_display['任務ID'].map(_task_lookup[_col])
+                df_display[_col] = df_display[_col].combine_first(_mapped) if _col in df_display else _mapped
+        if {'時間窗_開始', '時間窗_結束'}.issubset(_task_lookup.columns):
+            df_display['服務時段'] = df_display['任務ID'].map(_task_lookup['時間窗_開始'].astype(str) + '-' + _task_lookup['時間窗_結束'].astype(str))
+        _route_lookup = df_route_result.drop_duplicates('任務ID', keep='last').set_index('任務ID')
+        for _col in ['交通路段', '預估車程(分)', '路段緩衝(分)', '含緩衝交通時間(分)']:
+            df_display[_col] = df_display['任務ID'].map(_route_lookup[_col])
 
         has_date_for_display = "日期" in df_tasks.columns
 
@@ -1312,7 +2451,8 @@ if "last_result" in st.session_state:
 
             display_cols[1:1] = ["日期", "星期"]
 
-        show_table(df_display[display_cols], width="stretch", hide_index=True)
+        df_display = df_display.reindex(columns=display_cols)
+        show_table(df_display, width="stretch", hide_index=True)
 
         csv = export_frame(df_display[display_cols]).to_csv(index=False).encode("utf-8-sig")
 
@@ -1334,7 +2474,7 @@ if "last_result" in st.session_state:
 
         # ==========================================
 
-        st.subheader("🔎 Why this schedule?")
+        st.subheader("排班原因與配對說明")
 
         st.caption(
 
@@ -2083,7 +3223,7 @@ if "last_result" in st.session_state:
     # ==========================================
     # 區塊④：動態事件處理
     # ==========================================
-    st.header("④ ⚡ 動態事件處理")
+    section_title('changes', '04', '臨時異動', '處理新增服務、請假、改期與延遲。')
     st.caption(
         "遇到臨時狀況時先選事件類型；系統只展開需要的流程，"
         "並盡量保留其他既有班表不動。"
@@ -3786,7 +4926,7 @@ if "last_result" in st.session_state:
 
     # ==========================================
 
-    st.header("⑤ 居督人工覆寫（Supervisor Override）")
+    section_title('override', '05', '人工調整班表', '由居督確認並調整最終人選。')
 
     st.caption(
 
@@ -3822,6 +4962,23 @@ if "last_result" in st.session_state:
 
     # assigned_map 已於本區塊之前初始化並供月曆快速改派共用，此處沿用同一份。
 
+
+    st.markdown("##### 人工改派套用範圍")
+    st.radio(
+        "這次改派要套用到哪裡？",
+        ["僅本次", "後續同週期服務"],
+        horizontal=True,
+        key="override_apply_scope",
+        help=(
+            "僅本次：例如今天臨時請假，只改這一筆。"
+            "後續同週期服務：例如督導決定固定改由 B 居服員服務，"
+            "後續每週同一服務列會優先改為 B；若某週 B 不可行，只有該週才重新找人。"
+        ),
+    )
+    st.caption(
+        "固定班調整建議選「後續同週期服務」；臨時請假、單次代班建議選「僅本次」。"
+    )
+
     render_task_override_picker(
 
         df_tasks, df_result, res.get("df_cg", pd.DataFrame()), overrides,
@@ -3829,6 +4986,33 @@ if "last_result" in st.session_state:
         on_reassign=_quick_reassign, on_clear_override=_clear_override, on_list_candidates=_list_candidates,
 
     )
+
+
+    _prop_summary = st.session_state.get("last_override_propagation")
+    if _prop_summary:
+        _updated = int(_prop_summary.get("updated", 0))
+        _replanned = int(_prop_summary.get("replanned", 0))
+        _unassigned = int(_prop_summary.get("unassigned", 0))
+
+        if _unassigned:
+            st.warning(
+                f"固定班延續結果：{_updated} 筆沿用新居服員、"
+                f"{_replanned} 筆由系統重新找人、{_unassigned} 筆暫無可派人選。"
+            )
+        else:
+            st.success(
+                f"固定班延續結果：{_updated} 筆沿用新居服員、"
+                f"{_replanned} 筆由系統重新找人。"
+            )
+
+        _prop_details = _prop_summary.get("details", [])
+        if _prop_details:
+            with st.expander("查看後續週期調整明細", expanded=False):
+                show_table(
+                    pd.DataFrame(_prop_details),
+                    width="stretch",
+                    hide_index=True,
+                )
 
     st.subheader("📄 最終派單結果（含居督覆寫）")
 
@@ -3896,7 +5080,7 @@ if "last_result" in st.session_state:
 
             "預估車程(分)": ai_row["預估車程(分)"] if ai_row is not None else None,
 
-            "服務時段": ai_row["服務時段"] if ai_row is not None else "",
+            "服務時段": (str(task_row.get("時間窗_開始", "")) + "-" + str(task_row.get("時間窗_結束", ""))) if pd.notna(task_row.get("時間窗_開始")) and pd.notna(task_row.get("時間窗_結束")) else (ai_row["服務時段"] if ai_row is not None else ""),
 
             "任務優先級": ai_row["任務優先級"] if ai_row is not None else task_row.get("任務優先級", ""),
 

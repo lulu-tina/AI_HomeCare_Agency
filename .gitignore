@@ -1,32 +1,5 @@
-# Sensitive data & local databases
-00_input/
-00_DB/
-*.db
-*.sqlite
-*.sqlite3
-
-# Local export/raw data files
-*.xlsx
-*.csv
-
-# Caches & Virtual Environments
 __pycache__/
 *.pyc
-*.pyo
-.venv/
-venv/
-.env
-*.pem
-
-# IDE & OS metadata
-.vscode/
-.idea/
-.DS_Store
-
+*.bak*
 .streamlit/secrets.toml
-# OSRM generated map files
-osrm_motorcycle/data/*.osm.pbf
-osrm_motorcycle/data/*.osrm
-osrm_motorcycle/data/*.osrm.*
-osrm_motorcycle/build_info.json
-osrm_motorcycle/motorcycle.lua
+00_DB/*.xlsx
