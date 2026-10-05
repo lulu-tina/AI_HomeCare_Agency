@@ -508,12 +508,14 @@ with st.expander("🔒 個資顯示設定", expanded=False):
         "姓名匯入後會立即最小化遮罩（例如王O明→王○○），只供本頁顯示／選擇性匯出；排班、OR-Tools、Google Routes、OSRM 與稽核 log "
         "均使用 ID。Google Routes 僅收到必要的座標、時間與交通模式。"
     )
+    if have_names and st.session_state.get('_identity_display_version') != 2:
+        st.session_state['show_identity_names'] = True
+        st.session_state['_identity_display_version'] = 2
     _show_names = st.checkbox(
-        "畫面顯示 ID＋遮罩姓名",
-        value=False,
+        "畫面顯示遮罩姓名＋ID",
         key="show_identity_names",
         disabled=not have_names,
-        help="基於最小揭露原則，預設關閉；需要辨識人員時再暫時開啟。",
+        help="已載入姓名對照時預設開啟，方便辨識案家與居服員；可隨時關閉。",
     ) and have_names
     _export_names = (
         st.radio(
@@ -529,7 +531,7 @@ with st.expander("🔒 個資顯示設定", expanded=False):
     if have_names:
         st.success(
             f"姓名對照已隔離並遮罩：{len(_client_names)} 個案、{len(_caregiver_names)} 位居服員。"
-            "預設畫面與匯出均為代碼版。"
+            "畫面可顯示遮罩姓名；匯出仍可選擇代碼版或遮罩姓名版。"
         )
 
 # 僅在資料來源變更時（首次載入／換檔案／原檔被覆寫）重設編輯區，避免使用者的編輯內容被覆蓋

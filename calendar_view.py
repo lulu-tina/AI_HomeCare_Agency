@@ -43,25 +43,27 @@ def build_schedule_rows(result, tasks, caregivers, overrides=None, client_names=
         override = (overrides or {}).get(task_id)
         if override and override.get("cg_id"):
             tag = "代班" if "請假" in str(override.get("reason", "")) else "已調整"
-        code = str(row.get("Service_Code_1", ""))
+        codes = [str(row[key]).strip() for key in row.index if re.fullmatch(r"Service_Code_\d+", str(key)) and pd.notna(row[key]) and str(row[key]).strip()]
+        code = ' / '.join(codes)
         rows.append({"id": task_id, "date": day.date().isoformat(), "start": start, "end": end,
-                     "cg": cg, "client": client_id, "client_label": name_map_clients.get(client_id, client_id),
+                     "cg": cg, "client": client_id, "client_label": (name_map_clients[client_id] + '｜' + client_id) if client_id in name_map_clients else '姓名未對照｜' + client_id,
+                     "cg_label": str((caregiver_names or {}).get(cg, '')) + '｜' + cg,
                      "code": code if code != "nan" else "", "tag": tag, "reason": str((override or {}).get("reason", ""))})
     name_map = {str(k): str(v) for k, v in (caregiver_names or {}).items()}
-    labels = {cg: f"{cg}｜{name_map.get(cg, '')}".rstrip("｜") for cg in cg_ids}
+    labels = {cg: f"{name_map.get(cg, '姓名未對照')}｜{cg}" for cg in cg_ids}
     return rows, labels
 
 
 _GRID_CSS = """
-.cf-workspace {font-family:var(--st-font),sans-serif; color:#183d3d; overflow:auto; border:1px solid #dae8e2;border-radius:16px;background:#fff}
+.cf-workspace {font-family:var(--st-font),sans-serif; color:#183d3d; overflow:auto; max-height:780px; border:1px solid #dae8e2;border-radius:16px;background:#fff}
 .cf-head {display:grid;position:sticky;top:0;z-index:5;background:#f1f7f4;border-bottom:1px solid #dce9e3}
 .cf-head div {min-width:155px;padding:13px 10px;font-size:13px;font-weight:750;border-left:1px solid #e3eee8;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .cf-head div:first-child {min-width:64px;border-left:0}
 .cf-board {position:relative;display:grid;min-width:max-content}
 .cf-time {position:absolute;left:0;width:64px;text-align:center;color:#6b807b;font-size:12px;padding-top:2px}
-.cf-lane {position:relative;min-width:155px;border-left:1px solid #e3eee8;background:repeating-linear-gradient(to bottom,#fff 0,#fff 47px,#edf3ef 48px)}
-.cf-card {position:absolute;left:5px;right:5px;overflow:hidden;border:1px solid #a9d9c7;border-left:4px solid #16816c;border-radius:8px;background:#dff4eb;padding:5px 7px;box-sizing:border-box;cursor:grab;font-size:11px;line-height:1.35;z-index:2}
-.cf-card strong {display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:12px}
+.cf-lane {position:relative;min-width:155px;border-left:1px solid #e3eee8;background:repeating-linear-gradient(to bottom,#fff 0,#fff 83px,#edf3ef 84px)}
+.cf-card {position:absolute;left:5px;right:5px;overflow:hidden;border:1px solid #a9d9c7;border-left:4px solid #16816c;border-radius:8px;background:#dff4eb;padding:5px 7px;box-sizing:border-box;cursor:pointer;font-size:12px;line-height:1.4;z-index:2}
+.cf-card strong {display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:13px;padding-right:22px}
 .cf-card span {display:block}
 .cf-card[data-tag="隔週"] {background:#eeebff;border-color:#c7bcf5;border-left-color:#8067ce}
 .cf-card[data-tag="代班"],.cf-card[data-tag="已調整"] {background:#fff1d9;border-color:#f4d394;border-left-color:#e49a19}
@@ -69,48 +71,87 @@ _GRID_CSS = """
 .cf-card[draggable="true"]:active {cursor:grabbing}
 .cf-lane.cf-over {background-color:#f0f9f5}
 .cf-hint {color:#667e76;font-size:12px;margin:9px 0}
+.cf-handle {position:absolute;right:2px;top:2px;border:0;border-radius:5px;background:#ffffffaa;color:#155b4d;padding:2px 5px;cursor:grab;touch-action:none;user-select:none;font-size:18px;line-height:22px}
+.cf-details {position:absolute;bottom:3px;right:6px;border:0;background:transparent;color:#175b4d;text-decoration:underline;cursor:pointer;padding:0;margin-top:2px;font-size:12px}
+.cf-live {padding:9px 12px;margin-bottom:8px;background:#eaf5ee;color:#235b4b;border-radius:8px;font-size:13px;min-height:22px}
+.cf-drag-ghost {position:fixed;pointer-events:none;z-index:10000;background:#135e50;color:white;white-space:pre-line;padding:10px 14px;border-radius:9px;font-size:13px;box-shadow:0 4px 18px #0003}
+.cf-lane.cf-over {box-shadow:inset 0 0 0 2px #248974}
+.cf-card {user-select:none}
+.cf-event-person {padding-right:28px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.cf-head div {min-width:180px;white-space:normal}
+
 """
 
-_GRID_JS = """
-export default function({parentElement,data,setTriggerValue}) {
+_GRID_JS = r"""
+export default function({parentElement,data,setStateValue}) {
   const root=parentElement.querySelector('#cf-calendar'); root.replaceChildren();
   const days=data.days||[], people=data.people||[], rows=data.rows||[];
-  const first=8*60,last=21*60, step=30, px=48;
-  const min=(v)=>{const p=(v||'').split(':').map(Number);return p.length===2&&p.every(Number.isFinite)?p[0]*60+p[1]:null};
-  const clock=(n)=>String(Math.floor(n/60)).padStart(2,'0')+':'+String(n%60).padStart(2,'0');
+  const first=480,last=1260,step=30,px=84;
+  const minute=v=>{const p=(v||'').split(':').map(Number);return p.length===2&&p.every(Number.isFinite)?p[0]*60+p[1]:null};
+  const clock=n=>String(Math.floor(n/60)).padStart(2,'0')+':'+String(n%60).padStart(2,'0');
+  const el=(tag,cls,text)=>{const n=document.createElement(tag);if(cls)n.className=cls;if(text!==undefined)n.textContent=text;return n};
+  const emit=(kind,payload)=>{
+    status.textContent=kind==='select'?'正在開啟服務詳情…':'正在開啟改班確認視窗…';
+    setStateValue('action',{kind,...payload,nonce:globalThis.crypto?.randomUUID?.()||String(Date.now())+Math.random()});
+  };
   const lanes=data.mode==='week'?days.map(d=>({id:data.person,day:d,label:d})):people.map(p=>({id:p.id,day:days[0],label:p.label}));
-  const board=document.createElement('div');board.className='cf-workspace';
-  const head=document.createElement('div');head.className='cf-head';head.style.gridTemplateColumns='64px repeat('+lanes.length+', minmax(155px, 1fr))';
-  let corner=document.createElement('div');corner.textContent='時間';head.appendChild(corner);
-  for(const l of lanes){let el=document.createElement('div');el.textContent=l.label;head.appendChild(el)}board.appendChild(head);
-  const body=document.createElement('div');body.className='cf-board';body.style.gridTemplateColumns='64px repeat('+lanes.length+', minmax(155px, 1fr))';body.style.height=((last-first)/step*px)+'px';
-  const timeCol=document.createElement('div');timeCol.style.position='relative';
-  for(let t=first;t<last;t+=60){let el=document.createElement('div');el.className='cf-time';el.style.top=((t-first)/step*px)+'px';el.textContent=clock(t);timeCol.appendChild(el)}body.appendChild(timeCol);
-  let dragged=null;
+  const status=el('div','cf-live','點卡片或「詳情」查看；按住右上角 ⠿ 移動。');status.setAttribute('aria-live','polite');root.appendChild(status);
+  const board=el('div','cf-workspace');
+  const columns='64px repeat('+lanes.length+', minmax(180px, 1fr))';
+  const head=el('div','cf-head');head.style.gridTemplateColumns=columns;head.appendChild(el('div','','時間'));
+  lanes.forEach(l=>head.appendChild(el('div','',l.label)));board.appendChild(head);
+  const body=el('div','cf-board');body.style.gridTemplateColumns=columns;body.style.height=((last-first)/step*px)+'px';
+  const gutter=el('div');gutter.style.position='relative';
+  for(let t=first;t<last;t+=60){const n=el('div','cf-time',clock(t));n.style.top=((t-first)/step*px)+'px';gutter.appendChild(n)}body.appendChild(gutter);
+  const laneElements=[];let active=null,ghost=null;
+  function clean(){if(active?.card)active.card.style.opacity='';active=null;ghost?.remove();ghost=null;laneElements.forEach(x=>x.node.classList.remove('cf-over'))}
+  function targetAt(x,y){return laneElements.find(l=>{const r=l.node.getBoundingClientRect();return x>=r.left&&x<=r.right&&y>=r.top&&y<=r.bottom})}
+  function position(e){
+    const target=targetAt(e.clientX,e.clientY);if(!target)return null;
+    const r=target.node.getBoundingClientRect();let start=first+Math.round(((e.clientY-r.top-active.offset)/px*step)/5)*5;
+    if(Math.abs(e.clientY-active.y)<8)start=minute(active.row.start);
+    const duration=minute(active.row.end)-minute(active.row.start);start=Math.max(first,Math.min(last-duration,start));
+    return {target,start,end:start+duration};
+  }
   for(const lane of lanes){
-    const col=document.createElement('div');col.className='cf-lane';col.dataset.cg=lane.id;col.dataset.day=lane.day;
-    col.ondragover=e=>{e.preventDefault();col.classList.add('cf-over')};
-    col.ondragleave=()=>col.classList.remove('cf-over');
-    col.ondrop=e=>{e.preventDefault();col.classList.remove('cf-over');if(!dragged)return;
-      const r=col.getBoundingClientRect();const slot=Math.max(0,Math.min((last-first)/step-1,Math.floor((e.clientY-r.top)/px)));
-      const start=first+slot*step;const duration=min(dragged.end)-min(dragged.start);
-      if(duration<=0||start+duration>last)return;
-      setTriggerValue('move',{task_id:dragged.id,cg_id:lane.id,date:lane.day,start:clock(start),end:clock(start+duration)});
-      dragged=null;
-    };
+    const col=el('div','cf-lane');laneElements.push({node:col,...lane});
     for(const row of rows.filter(x=>x.cg===lane.id&&x.date===lane.day)){
-      const begin=min(row.start),end=min(row.end);if(begin===null||end===null||end<=first||begin>=last)continue;
-      const card=document.createElement('div');card.className='cf-card';card.dataset.tag=row.tag;
-      card.style.top=(Math.max(0,(begin-first)/step*px)+2)+'px';card.style.height=Math.max(28,(Math.min(last,end)-Math.max(first,begin))/step*px-4)+'px';
-      card.draggable=true;card.tabIndex=0;card.title=row.client_label+'｜'+row.start+'–'+row.end+'｜'+row.code+'｜'+row.tag;
-      let title=document.createElement('strong');title.textContent=row.client_label+' · '+row.code;card.appendChild(title);
-      let details=document.createElement('span');details.textContent=row.start+'–'+row.end+' · '+row.tag;card.appendChild(details);
-      card.ondragstart=e=>{dragged=row;e.dataTransfer.effectAllowed='move';e.dataTransfer.setData('text/plain',row.id)};
-      card.onclick=()=>setTriggerValue('select',row.id);
-      card.onkeydown=e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();setTriggerValue('select',row.id)}};
+      const begin=minute(row.start),end=minute(row.end);if(begin===null||end===null||end<=first||begin>=last)continue;
+      const card=el('div','cf-card');card.dataset.tag=row.tag;card.tabIndex=0;card.setAttribute('role','button');
+      card.style.top=(Math.max(0,(begin-first)/step*px)+2)+'px';card.style.height=Math.max(30,(Math.min(last,end)-Math.max(first,begin))/step*px-4)+'px';
+      card.title=[row.client_label,row.start+'–'+row.end,row.code,row.tag,row.cg_label].join('｜');card.setAttribute('aria-label',card.title);
+      const title=el('strong','',row.client_label);card.appendChild(title);
+      card.appendChild(el('span','cf-event-time',row.start+'–'+row.end+' · '+row.tag));
+      card.appendChild(el('span','cf-event-code',row.code));
+      card.appendChild(el('span','cf-event-person',row.cg_label));
+      const details=el('button','cf-details','詳情');details.type='button';details.onclick=e=>{e.stopPropagation();emit('select',{task_id:row.id})};card.appendChild(details);
+      const handle=el('button','cf-handle','⠿');handle.type='button';handle.title='按住並移動：換人／改時間';handle.setAttribute('aria-label','拖曳調整班表');card.appendChild(handle);
+      card.onclick=e=>{if(e.target!==handle)emit('select',{task_id:row.id})};
+      card.onkeydown=e=>{if(e.target===card&&(e.key==='Enter'||e.key===' ')){e.preventDefault();emit('select',{task_id:row.id})}};
+      handle.onclick=e=>e.stopPropagation();
+      handle.onpointerdown=e=>{if(e.button!==0)return;e.preventDefault();e.stopPropagation();clean();active={row,card,x:e.clientX,y:e.clientY,offset:e.clientY-card.getBoundingClientRect().top,moved:false};handle.setPointerCapture(e.pointerId)};
+      handle.onpointermove=e=>{
+        if(!active)return;
+        if(!active.moved&&Math.hypot(e.clientX-active.x,e.clientY-active.y)<6)return;
+        active.moved=true;active.card.style.opacity='.45';
+        if(!ghost){ghost=el('div','cf-drag-ghost');root.appendChild(ghost)}
+        ghost.style.left=(e.clientX+14)+'px';ghost.style.top=(e.clientY+12)+'px';
+        laneElements.forEach(l=>l.node.classList.remove('cf-over'));const p=position(e);
+        if(p){p.target.node.classList.add('cf-over');ghost.textContent=p.target.label+'\n'+clock(p.start)+'–'+clock(p.end);status.textContent='放開後預覽：'+p.target.label+' '+clock(p.start)+'–'+clock(p.end)}
+        else {ghost.textContent='請移到班表欄位內';status.textContent='移至班表內才可放開調整。'}
+      };
+      handle.onpointerup=e=>{
+        if(!active)return;const source=active.row;const p=position(e);const moved=active.moved;clean();
+        if(handle.hasPointerCapture(e.pointerId))handle.releasePointerCapture(e.pointerId);
+        if(moved&&p&&(p.target.id!==source.cg||p.target.day!==source.date||p.start!==minute(source.start)))emit('move',{task_id:source.id,cg_id:p.target.id,date:p.target.day,start:clock(p.start),end:clock(p.end)});
+        else status.textContent='未更動班表。';
+      };
+      handle.onpointercancel=()=>{clean();status.textContent='已取消拖曳。'};
       col.appendChild(card);
     }body.appendChild(col);
-  }board.appendChild(body);root.appendChild(board);
+  }
+  board.appendChild(body);root.appendChild(board);
+  return ()=>clean();
 }
 """
 
@@ -121,35 +162,40 @@ def _render_grid(rows, people, days, mode, person=""):
         return None
     component = st.components.v2.component("careflow_time_grid", html='<div id="cf-calendar"></div>', css=_GRID_CSS, js=_GRID_JS)
     return component(data={"rows": rows, "people": people, "days": days, "mode": mode, "person": person},
-                     key="careflow_grid", default={"move": None, "select": None}, on_move_change=lambda: None, on_select_change=lambda: None)
+                     key="careflow_grid_v2", default={"action": None}, on_action_change=lambda: None)
 
 
 def _close_assignment_dialog():
     st.session_state.pop("cf_selected_task", None)
+    st.session_state.pop("cf_move_preview", None)
     st.session_state.pop("cf_dialog_error", None)
     st.session_state.pop("cf_dialog_candidates", None)
 
 
 def _open_assignment_dialog(task_id):
+    # Fresh widget values when reopening a task after a prior move or cancellation.
+    for prefix in ('cf_dialog_cg_', 'cf_dialog_scope_', 'cf_edit_date_', 'cf_edit_time_', 'cf_dialog_reason_'):
+        st.session_state.pop(prefix + str(task_id), None)
     st.session_state["cf_selected_task"] = str(task_id)
     st.session_state.pop("cf_move_preview", None)
     st.session_state.pop("cf_dialog_error", None)
     st.session_state.pop("cf_dialog_candidates", None)
 
 
-def _process_assignment_request(on_reassign):
+def _process_assignment_request(on_reassign, on_move=None):
     # Run once during the full app rerun, before the scope widget is rendered.
     request = st.session_state.pop("cf_assignment_request", None)
     if not request:
         return
     st.session_state["cf_selected_task"] = request["task_id"]
-    if not callable(on_reassign):
+    callback = on_move if request.get('kind') == 'move' else on_reassign
+    if not callable(callback):
         st.session_state["cf_dialog_error"] = "目前未接上改派功能，請確認 app.py 與 calendar_view.py 版本一致。"
         return
     st.session_state["override_apply_scope"] = request["scope"]
     try:
         with st.spinner("正在檢查資格、時段、工時與交通，請稍候…"):
-            error = on_reassign(request["task_id"], request["cg_id"], request["reason"])
+            error = callback(request['draft'], request['reason'], request['scope']) if request.get('kind') == 'move' else callback(request["task_id"], request["cg_id"], request["reason"])
     except Exception as exc:
         error = "安排未完成：" + str(exc)
     if error:
@@ -162,7 +208,7 @@ def _process_assignment_request(on_reassign):
 
 
 @st.dialog("安排居服員", width="medium", on_dismiss=_close_assignment_dialog)
-def _assignment_dialog(row, labels, on_list_candidates, can_reassign):
+def _assignment_dialog(row, labels, on_list_candidates, can_reassign, can_move=False):
     task_id = row["id"]
     st.markdown(f"**{row['client_label']}** · {row['code']} · {row['tag']}")
     st.caption(f"{row['date']} {row['start']}–{row['end']} · 目前：{labels.get(row['cg'], '未安排')} · 任務 {task_id}")
@@ -191,9 +237,13 @@ def _assignment_dialog(row, labels, on_list_candidates, can_reassign):
         if info is None:
             return labels[cg] + " · 尚未檢查"
         return labels[cg] + (" · 可派" if info.get("available") else " · " + str(info.get("detail") or "不符合條件"))
-    choice = st.selectbox("指定居服員", choices, index=None, placeholder="搜尋或選擇居服員", format_func=option_label, key="cf_dialog_cg_" + task_id)
+    choice = st.selectbox("指定居服員", choices, index=choices.index(row["cg"]) if row["cg"] in choices else None, placeholder="搜尋或選擇居服員", format_func=option_label, key="cf_dialog_cg_" + task_id)
     st.caption("可直接選人；按『確認安排』時仍會重新檢查是否可派。")
     scope = st.radio("套用範圍", ["僅本次", "後續同週期服務"], horizontal=True, key="cf_dialog_scope_" + task_id)
+    with st.expander("需要更改日期或開始時間？"):
+        changed_date = st.date_input("新日期", value=pd.Timestamp(row['date']).date(), key='cf_edit_date_' + task_id)
+        changed_time = st.time_input("新開始時間", value=datetime.strptime(row['start'], '%H:%M').time(), step=300, key='cf_edit_time_' + task_id)
+        st.caption('服務分鐘維持原長度；只更換居服員時不用修改。')
     reason = st.text_input("安排／改派原因（必填）", placeholder="例如：補排未安排服務、臨時代班", key="cf_dialog_reason_" + task_id)
     c1, c2 = st.columns(2)
     if c1.button("確認安排", type="primary", width="stretch", key="cf_dialog_confirm_" + task_id, disabled=not can_reassign):
@@ -202,18 +252,58 @@ def _assignment_dialog(row, labels, on_list_candidates, can_reassign):
         elif not reason.strip():
             st.warning("請填寫安排原因。")
         else:
-            st.session_state["cf_assignment_request"] = {"task_id": task_id, "cg_id": choice, "scope": scope, "reason": reason.strip()}
+            if changed_date.isoformat() != row['date'] or changed_time.strftime('%H:%M') != row['start']:
+                if not can_move:
+                    st.error('主程式未接上時段調整功能，請一起更新 app.py。')
+                    return
+                if scope != '僅本次':
+                    st.warning('更改日期或時段請選「僅本次」。')
+                    return
+                duration = datetime.strptime(row['end'], '%H:%M') - datetime.strptime(row['start'], '%H:%M')
+                end = datetime.combine(changed_date, changed_time) + duration
+                if end.date() != changed_date:
+                    st.warning('服務不能跨日。')
+                    return
+                draft = {'task_id':task_id, 'cg_id':choice, 'date':changed_date.isoformat(), 'start':changed_time.strftime('%H:%M'), 'end':end.strftime('%H:%M')}
+                st.session_state['cf_assignment_request'] = {'kind':'move','task_id':task_id,'draft':draft,'scope':scope,'reason':reason.strip()}
+            else:
+                st.session_state["cf_assignment_request"] = {"task_id": task_id, "cg_id": choice, "scope": scope, "reason": reason.strip()}
             st.rerun()
     if c2.button("取消", width="stretch", key="cf_dialog_cancel_" + task_id):
         _close_assignment_dialog()
         st.rerun()
 
 
+@st.dialog("確認拖曳調班", width="medium", on_dismiss=_close_assignment_dialog)
+def _move_dialog(original, draft, labels, can_move):
+    st.markdown(f"**{original['client_label']}** · {original['code']}")
+    st.write(f"原班：{original['date']} {original['start']}–{original['end']} · {labels.get(original['cg'], '未安排')}")
+    st.write(f"新班：{draft['date']} {draft['start']}–{draft['end']} · {labels.get(draft['cg_id'], draft['cg_id'])}")
+    if st.session_state.get('cf_dialog_error'):
+        st.error(st.session_state['cf_dialog_error'])
+    scope = st.radio('套用範圍', ['僅本次', '後續同週期服務'], horizontal=True, key='cf_move_scope')
+    reason = st.text_input('調整原因（必填）', key='cf_move_reason')
+    c1,c2=st.columns(2)
+    if c1.button('確認調整', type='primary', key='cf_confirm_move', disabled=not can_move):
+        if not reason.strip():
+            st.warning('請填寫調整原因。')
+        elif scope != '僅本次' and (draft['date'], draft['start'], draft['end']) != (original['date'], original['start'], original['end']):
+            st.warning('更改日期或時段時請選「僅本次」。')
+        else:
+            st.session_state['cf_assignment_request'] = {'kind':'move', 'task_id':original['id'], 'draft':draft, 'scope':scope, 'reason':reason.strip()}
+            st.rerun()
+    if c2.button('取消', key='cf_cancel_move'):
+        _close_assignment_dialog()
+        st.rerun()
+
+
 def render_calendar_overview(result, tasks, caregivers, overrides=None, on_reassign=None,
                              on_list_candidates=None, on_move=None, client_names=None, caregiver_names=None, **kwargs):
-    _process_assignment_request(on_reassign)
+    _process_assignment_request(on_reassign, on_move)
     rows, labels = build_schedule_rows(result, tasks, caregivers, overrides, client_names, caregiver_names)
     st.markdown("### 班表工作台")
+    if any(r["client_label"].startswith("姓名未對照｜") for r in rows) or any(v.startswith("姓名未對照｜") for v in labels.values()):
+        st.info("部分姓名尚未顯示。請在『個資顯示設定』開啟姓名，並確認 Excel 的『案家姓名對照』與『居服員姓名對照』包含對應 ID。")
     notice = st.session_state.pop("cf_assignment_notice", None)
     if notice:
         st.success(notice)
@@ -286,8 +376,19 @@ def render_calendar_overview(result, tasks, caregivers, overrides=None, on_reass
             days=[(chosen+timedelta(days=i)).isoformat() for i in range(7)]
             st.caption(f"查看 {days[0]} ～ {days[-1]}；切換居服員即可查看其他人的整週班表。")
             grid=_render_grid(rows,[],days,"week",person)
-        st.caption("拖曳服務卡片可預覽換人或改時段；確認前不會更改班表。點卡片可看詳情。時段以 30 分鐘為單位，原服務分鐘保持不變。")
+        st.caption("點卡片或「詳情」開啟視窗；按住卡片右上角 ⠿ 拖曳，放開後確認。可精確至 5 分鐘，原服務分鐘不變；也可在詳情內直接輸入日期和時間。")
     pending_clicked = False
+    with left:
+        visible_rows = [r for r in rows if r['date'] == selected_day.isoformat()] if mode == '全員日班' else [r for r in rows if r['date'] in days and r['cg'] == person]
+        with st.expander('搜尋服務／直接開啟詳情'):
+            by_id = {r['id']: r for r in visible_rows}
+            def service_label(task_id):
+                r = by_id[task_id]
+                return f"{r['date']} {r['start']} · {r['client_label']} · {labels.get(r['cg'], '未安排')} · {r['code']}"
+            picked = st.selectbox('服務', list(by_id), index=None, format_func=service_label, placeholder='搜尋案家、居服員或服務代碼', key='cf_direct_service')
+            if st.button('開啟服務詳情', disabled=picked is None, key='cf_direct_open'):
+                pending_clicked = True
+                _open_assignment_dialog(picked)
     with right:
         visible_day = selected_day.isoformat() if mode == "全員日班" else None
         pending=[r for r in rows if not r["cg"] and (visible_day is None and r["date"] in days or r["date"]==visible_day)]
@@ -303,52 +404,34 @@ def render_calendar_overview(result, tasks, caregivers, overrides=None, on_reass
             st.caption("這段期間沒有未安排服務。")
         if len(pending)>12:
             st.caption(f"還有 {len(pending)-12} 筆，請縮小日期範圍。")
-    if grid is not None and not pending_clicked:
-        if grid.select:
-            _open_assignment_dialog(str(grid.select))
-        if grid.move:
-            move=grid.move
-            source=next((r for r in rows if r["id"]==move.get("task_id")),None)
-            target=move.get("cg_id")
-            if source and target in labels and re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(move.get("date", ""))):
-                if (source["cg"],source["date"],source["start"])!=(target,move["date"],move["start"]):
-                    st.session_state["cf_move_preview"]=move
-                    st.session_state.pop("cf_selected_task",None)
-    draft=st.session_state.get("cf_move_preview")
+    action = getattr(grid, 'action', None) if grid is not None else None
+    if action and action.get('nonce') != st.session_state.get('cf_last_grid_action'):
+        st.session_state['cf_last_grid_action'] = action.get('nonce')
+        if not pending_clicked:
+            if action.get('kind') == 'select':
+                _open_assignment_dialog(str(action.get('task_id', '')))
+            elif action.get('kind') == 'move':
+                source = next((r for r in rows if r['id'] == action.get('task_id')), None)
+                if source and action.get('cg_id') in labels:
+                    st.session_state['cf_move_preview'] = action
+                    st.session_state.pop('cf_selected_task', None)
+                    st.session_state.pop('cf_dialog_error', None)
+    draft = st.session_state.get('cf_move_preview')
     if draft:
-        original=next((r for r in rows if r["id"]==draft.get("task_id")),None)
+        original = next((r for r in rows if r['id'] == draft.get('task_id')), None)
         if original:
-            with st.container(border=True):
-                st.markdown("#### 確認班表變更")
-                st.write(f"{original['client_label']}｜{original['date']} {original['start']}–{original['end']} · {labels.get(original['cg'],'未安排')}")
-                st.write(f"→ {draft['date']} {draft['start']}–{draft['end']} · {labels.get(draft['cg_id'],draft['cg_id'])}")
-                scope=st.radio("套用範圍",["僅本次","後續同週期服務"],horizontal=True,key="cf_move_scope")
-                reason=st.text_input("調整原因（必填）",key="cf_move_reason",placeholder="例如：居服員請假、案家改期")
-                c1,c2=st.columns(2)
-                if c1.button("確認調整",type="primary",key="cf_confirm_move"):
-                    if not reason.strip():
-                        st.warning("請填寫調整原因。")
-                    elif scope=="後續同週期服務" and (draft['date'],draft['start'],draft['end'])!=(original['date'],original['start'],original['end']):
-                        st.warning("更改日期或服務時段時，請先選『僅本次』；固定服務時段請在來源週服務計畫調整。")
-                    elif callable(on_move):
-                        err=on_move(draft,reason.strip(),scope)
-                        if err: st.error(str(err))
-                        else:
-                            st.session_state.pop("cf_move_preview",None)
-                            st.rerun()
-                if c2.button("取消",key="cf_cancel_move"):
-                    st.session_state.pop("cf_move_preview",None)
-                    st.rerun()
+            _move_dialog(original, draft, labels, callable(on_move))
         else:
-            st.session_state.pop("cf_move_preview",None)
-    selected_id = st.session_state.get("cf_selected_task")
-    if selected_id and not st.session_state.get("cf_move_preview"):
-        selected_row = next((r for r in rows if r["id"] == selected_id), None)
-        if selected_row:
-            _assignment_dialog(selected_row, labels, on_list_candidates, callable(on_reassign))
-        else:
-            _close_assignment_dialog()
-            st.warning("選取的任務已不在目前班表，請重新選擇。")
+            st.session_state.pop('cf_move_preview', None)
+    else:
+        selected_id = st.session_state.get('cf_selected_task')
+        if selected_id:
+            selected_row = next((r for r in rows if r['id'] == selected_id), None)
+            if selected_row:
+                _assignment_dialog(selected_row, labels, on_list_candidates, callable(on_reassign), callable(on_move))
+            else:
+                _close_assignment_dialog()
+                st.warning('選取的任務已不在目前班表，請重新選擇。')
 
 
 def render_task_override_picker(tasks,result,caregivers,overrides,on_reassign=None,on_clear_override=None,on_list_candidates=None,**kwargs):

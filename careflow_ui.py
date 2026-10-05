@@ -45,7 +45,7 @@ h1,h2,h3 { color:var(--cf-ink); letter-spacing:-.025em; }
 def render_brand():
     st.markdown(CSS, unsafe_allow_html=True)
     st.markdown('''<div class="cf-hero"><div class="cf-eyebrow">CAREFLOW · 居服排班工作台</div><h1>把排班變得更簡單。</h1><p>整合服務資料，產生排班草案，讓每一次照顧安排更清楚。</p><div class="cf-steps"><span>01　匯入 Excel</span><span>02　確認資料</span><span>03　產生班表</span></div></div>''', unsafe_allow_html=True)
-    st.caption('🔒 排班使用 ID，姓名預設遮罩並關閉顯示；可在「個資顯示設定」調整。')
+    st.caption('🔒 排班使用 ID，姓名以遮罩方式顯示；可在「個資顯示設定」調整。')
 
 def section_title(anchor, number, title, description):
     from html import escape
