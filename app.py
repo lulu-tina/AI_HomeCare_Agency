@@ -32,6 +32,9 @@
 
 """
 from dataclasses import replace
+from osrm_client import ensure_ready
+from schedule_output import build_schedule_output, schedule_excel_bytes, MAIN_COLUMNS
+from dispatch_workflow import WorkflowStore, attach_blocks, blocked_reason, render_leave, render_queue
 
 
 from datetime import datetime
@@ -352,13 +355,21 @@ with st.sidebar:
         st.button('🔄 還原預設值', width='stretch', on_click=reset_policy_defaults)
 
     with st.expander('交通說明',expanded=False):
+        if st.button('檢查機車交通連線', key='check_motorcycle_connection', width='stretch'):
+            try:
+                with st.spinner('檢查雲端機車路網；服務休眠時啟動可能需要約一分鐘…'):
+                    connection = ensure_ready(force=True)
+                st.success(f"{connection['狀態']}｜耗時 {connection['檢查耗時(秒)']} 秒")
+            except Exception as exc:
+                st.error(str(exc))
+        st.caption('此按鈕只確認連線，不驗證交通準確度；檢查使用公開街道座標。')
         st.caption('交通來源固定：機車走自架 OSRM；公車／捷運走 Google Routes TRANSIT，依 Excel 交通工具自動分流。')
         st.caption('OSRM／Google 會將座標送往指定路網服務；大眾運輸不再使用本機直線概算。')
         if provider in ('google','hybrid'):
             if google_key_is_configured():
                 st.caption('Google 金鑰：已讀取設定（未驗證 API 權限）。')
             else:
-                st.warning('未讀到 Google 金鑰，請確認此專案的 .streamlit/secrets.toml 有 GOOGLE_MAPS_API_KEY。')
+                st.warning('未讀到 Google 金鑰：本機請檢查 .streamlit/secrets.toml；雲端請檢查 Manage app → Settings → Secrets 的 GOOGLE_MAPS_API_KEY。')
             st.caption('交通來源固定：機車使用自架 OSRM；大眾運輸從候選配對、排班到轉場時間皆使用 Google Routes TRANSIT。')
 
     urgent_priority_bonus = defaults.urgent_priority_bonus
@@ -788,6 +799,8 @@ if 'last_result' in st.session_state and st.session_state['last_result'].get('in
     st.session_state.pop('overrides',None)
 
 
+_workflow_store = WorkflowStore(st.session_state.get('_data_source_key', 'default'))
+
 _tasks_preview_df = st.session_state["edit_tasks"]
 
 # ============================================================
@@ -894,7 +907,10 @@ def _run_ai_by_day(tasks_for_ai, caregivers, cfg, label):
         if not matches.empty:
             match_frames.append(matches)
 
-        diagnostics.extend(matches.attrs.get("matching_diagnostics", []))
+        day_diagnostics={str(d.get('任務ID')):dict(d) for d in matches.attrs.get('matching_diagnostics',[])}
+        for tid,reasons in phase.get('pending_details',{}).items():
+            day_diagnostics.setdefault(str(tid),{'任務ID':tid})['逐人排班原因']=reasons
+        diagnostics.extend(day_diagnostics.values())
 
     progress.progress(1.0, text=f"{label}完成")
 
@@ -910,7 +926,7 @@ if not has_date_column:
     if st.button("開始 AI 排班", type="primary", width="stretch"):
         begin_travel_query_run(google_query_limit)
 
-        df_cg = st.session_state["edit_cg"].copy()
+        df_cg = attach_blocks(st.session_state["edit_cg"], _workflow_store)
         df_cl = st.session_state["edit_cl"].copy()
         df_hist = st.session_state["data_hist"].copy()
         df_tasks = st.session_state["edit_tasks"].copy()
@@ -1019,7 +1035,7 @@ else:
         ):
             begin_travel_query_run(google_query_limit)
 
-            df_cg = st.session_state["edit_cg"].copy()
+            df_cg = attach_blocks(st.session_state["edit_cg"], _workflow_store)
             df_cl = st.session_state["edit_cl"].copy()
             df_hist = st.session_state["data_hist"].copy()
             df_tasks_all = st.session_state["edit_tasks"].copy()
@@ -1130,6 +1146,7 @@ else:
 if "last_result" in st.session_state:
 
     res = st.session_state["last_result"]
+    res["df_cg"] = attach_blocks(res["df_cg"], _workflow_store)
 
     df_tasks = res["df_tasks"]
 
@@ -1164,6 +1181,30 @@ if "last_result" in st.session_state:
 
     overrides = st.session_state["overrides"]
 
+    # Persisted unavailability applies to every entrance, including an old baseline.
+    _wf_people = {str(r['居服員ID']): r for _, r in res['df_cg'].iterrows()}
+    _wf_effective = apply_overrides_to_result(df_result, overrides)
+    _wf_assignments = dict(zip(_wf_effective.get('任務ID', []), _wf_effective.get('派單居服員', [])))
+    for _, _wf_task in df_tasks.iterrows():
+        _wf_tid = str(_wf_task['任務ID'])
+        _wf_cg = str(_wf_assignments.get(_wf_task['任務ID'], ''))
+        _wf_block = blocked_reason(_wf_task, _wf_people[_wf_cg]) if _wf_cg in _wf_people else None
+        if _wf_block:
+            overrides[_wf_tid] = {'cg_id': None, 'reason': _wf_block}
+            _wf_record = _workflow_store.record(_wf_task, '')
+            _workflow_store.save(_wf_tid, {**_wf_record, 'note': _wf_block})
+    for _wf_item in st.session_state.get('dynamic_insertions', []):
+        _wf_cg = str(_wf_item.get('cg_id') or '')
+        if _wf_cg in _wf_people and blocked_reason(_wf_item['task'], _wf_people[_wf_cg]):
+            _wf_item['cg_id'] = None
+    _wf_rejected = []
+    for _, _wf_task in df_tasks.iterrows():
+        _wf_saved = _workflow_store.get(str(_wf_task['任務ID']))
+        _wf_cg = str(_wf_assignments.get(_wf_task['任務ID'], '') or '')
+        # An explicitly rejected unchanged assignment must not return on reload.
+        if _wf_saved.get('rejected_signature') == __import__('dispatch_workflow').task_signature(_wf_task, _wf_cg):
+            overrides[str(_wf_task['任務ID'])] = {'cg_id':None, 'reason':_wf_saved.get('note','拒接／撤回')}
+
     assigned_map = dict(zip(df_result["任務ID"], df_result["派單居服員"])) if not df_result.empty else {}
 
     task_locations = (
@@ -1176,7 +1217,7 @@ if "last_result" in st.session_state:
 
     )
 
-    def _quick_reassign(task_id, new_cg_id, reason):
+    def _quick_reassign(task_id, new_cg_id, reason, apply_scope=None):
 
         """統一的居督覆寫寫入入口：即時衝突檢查通過後，寫入 overrides 狀態與稽覈
 
@@ -1222,7 +1263,7 @@ if "last_result" in st.session_state:
 
         if (
             new_cg_id is not None
-            and st.session_state.get("override_apply_scope", "僅本次") == "後續同週期服務"
+            and (apply_scope or st.session_state.get("override_apply_scope", "僅本次")) == "後續同週期服務"
         ):
             st.session_state["last_override_propagation"] = _propagate_recurring_override(
                 task_id, new_cg_id, reason
@@ -2074,8 +2115,24 @@ if "last_result" in st.session_state:
 
             st.warning("OR-Tools 無法在目前資料與參數下找到最佳解，請檢查資料是否有效或調整參數。")
 
-    travel_tasks = merge_task_client_tables(df_tasks, res['df_cl'])
-    route_signature = repr(sorted((str(k),repr(v)) for k,v in overrides.items()))
+    _operational_tasks = df_tasks.copy()
+    _operational_assignments = apply_overrides_to_result(df_result, overrides)
+    for _insertion in st.session_state.get('dynamic_insertions', []):
+        _inserted = _insertion['task']
+        _operational_tasks = pd.concat([_operational_tasks, pd.DataFrame([_inserted])], ignore_index=True)
+        _operational_assignments = pd.concat([_operational_assignments,
+            pd.DataFrame([{'任務ID': _inserted['任務ID'], '派單居服員': _insertion.get('cg_id')}])], ignore_index=True)
+    _operational_tasks = _operational_tasks.drop_duplicates('任務ID', keep='last')
+    _operational_assignments = _operational_assignments.drop_duplicates('任務ID', keep='last')
+    if '派單居服員' in _operational_assignments:
+        _operational_assignments = _operational_assignments.loc[
+            _operational_assignments['派單居服員'].notna() &
+            ~_operational_assignments['派單居服員'].astype(str).isin(['', '未指派', 'None', 'nan'])].copy()
+    travel_tasks = merge_task_client_tables(_operational_tasks, res['df_cl'])
+    route_signature = hashlib.sha256(repr((
+        _operational_assignments[['任務ID', '派單居服員']].sort_values('任務ID').to_dict('records'),
+        travel_tasks.sort_values('任務ID').to_dict('records'), res['df_cg'].to_dict('records'), vars(config)
+    )).encode()).hexdigest()
 
     if res.get("weekly_workflow") and res.get("extended_to_end"):
         st.markdown("### ③ 完整月份交通（需要時再算）")
@@ -2091,10 +2148,7 @@ if "last_result" in st.session_state:
         ):
             try:
                 res["route_result"] = calculate_schedule_travel(
-                    apply_overrides_to_result(
-                        df_result,
-                        overrides,
-                    ),
+                    _operational_assignments,
                     travel_tasks,
                     res["df_cg"],
                     config,
@@ -2111,38 +2165,21 @@ if "last_result" in st.session_state:
                     + str(exc)
                 )
 
-        elif "route_result" not in res:
+        elif "route_result" not in res or res.get("route_signature") != route_signature:
             res["route_result"] = pd.DataFrame()
 
     else:
-        if (
-            res.get("route_signature")
-            != route_signature
-            or "route_result" not in res
-        ):
-            try:
-                res["route_result"] = calculate_schedule_travel(
-                    apply_overrides_to_result(
-                        df_result,
-                        overrides,
-                    ),
-                    travel_tasks,
-                    res["df_cg"],
-                    config,
-                )
-                res[
-                    "route_signature"
-                ] = route_signature
-                res.pop(
-                    "google_verified_signature",
-                    None,
-                )
-            except Exception as exc:
-                st.error(
-                    "交通查詢失敗："
-                    + str(exc)
-                )
-                st.stop()
+        from schedule_checks import incremental_travel
+        try:
+            res['route_result']=incremental_travel(
+                _operational_assignments,travel_tasks,res['df_cg'],config,
+                res.setdefault('_daily_route_cache',{}),calculate_schedule_travel)
+            if res.get('route_signature') != route_signature:
+                res.pop('google_verified_signature',None)
+            res['route_signature']=route_signature
+        except Exception as exc:
+            st.error('交通暫未計算，班表仍可檢視與下載；估計交通留空。原因：'+str(exc))
+            res['route_result'] = pd.DataFrame()
     df_route_result = res.get('route_result', pd.DataFrame()).copy()
     _route_columns = ['任務ID', '交通日期', '派單居服員', '交通路段', '預估車程(分)',
                       '路段緩衝(分)', '含緩衝交通時間(分)', '交通計算狀態']
@@ -2150,7 +2187,7 @@ if "last_result" in st.session_state:
     df_route_result['預估車程(分)'] = pd.to_numeric(df_route_result['預估車程(分)'], errors='coerce')
     daily_travel = summarize_schedule_travel(df_route_result)
 
-    _effective_for_kpi = apply_overrides_to_result(df_result, overrides)
+    _effective_for_kpi = _operational_assignments.copy()
     _task_ids = set(df_tasks['任務ID'].dropna().astype(str))
     if {'任務ID', '派單居服員'}.issubset(_effective_for_kpi.columns):
         _valid_assignee = _effective_for_kpi['派單居服員'].notna() & ~_effective_for_kpi['派單居服員'].astype(str).str.strip().isin(['', '未指派', 'nan', 'None'])
@@ -2207,11 +2244,15 @@ if "last_result" in st.session_state:
                 if count is None:
                     return '缺少候選診斷，尚無法判定原因', None, ''
                 if count == 0:
-                    return '沒有通過配對條件的候選人', count, item.get('剔除原因', '')
-                return '有候選但未排入；需核對時段、交通、工時及求解限制', count, item.get('剔除原因', '')
-            _pending_report[['診斷', '候選數', '候選剔除明細']] = pd.DataFrame(
+                    return '無人通過資格或可服務時段檢查，請先修正人員資料', count, str(item.get('剔除原因', ''))
+                checked=item.get('逐人排班原因',[])
+                if checked and not overrides:
+                    details='；'.join(str(r['居服員ID'])+'：'+r['原因'] for r in checked)
+                    return '已嘗試全部候選，均無法加入目前班表；原因見右欄', count, details
+                return '初篩通過不等於可派；請至「接單與待辦」檢查目前人選', count, '目前班表尚未逐人複查；初篩排除原因：'+str(item.get('剔除原因',''))
+            _pending_report[['診斷', '初篩人數', '未派原因與處理提示']] = pd.DataFrame(
                 [_pending_diagnosis(t) for t in _pending_report['任務ID']], index=_pending_report.index)
-            _pending_columns = [c for c in ['日期','任務ID','案家ID','時間窗_開始','時間窗_結束','Service_Code_1','診斷','候選數','候選剔除明細'] if c in _pending_report]
+            _pending_columns = [c for c in ['日期','任務ID','案家ID','時間窗_開始','時間窗_結束','Service_Code_1','診斷','初篩人數','未派原因與處理提示'] if c in _pending_report]
             show_table(_pending_report[_pending_columns], hide_index=True, width='stretch')
             st.download_button('下載未派任務診斷 CSV', export_frame(_pending_report[_pending_columns]).to_csv(index=False).encode('utf-8-sig'), '未派任務診斷.csv', 'text/csv', key='download_pending_diagnostics')
 
@@ -2279,6 +2320,7 @@ if "last_result" in st.session_state:
         on_reassign=_quick_reassign, on_list_candidates=_list_candidates,
         on_move=_calendar_move,
         period_start=res.get('week_start'),
+        workflow_store=_workflow_store,
         client_names=_client_names if _show_names else {},
         caregiver_names=_caregiver_names if _show_names else {},
 
@@ -2402,7 +2444,6 @@ if "last_result" in st.session_state:
 
         st.pyplot(fig)
 
-    st.subheader("📋 指派明細表")
 
     if _effective_for_kpi.empty:
 
@@ -2454,21 +2495,22 @@ if "last_result" in st.session_state:
             display_cols[1:1] = ["日期", "星期"]
 
         df_display = df_display.reindex(columns=display_cols)
-        show_table(df_display, width="stretch", hide_index=True)
+        with st.expander('演算法指派明細（進階）', expanded=False):
+            show_table(df_display, width="stretch", hide_index=True)
 
-        csv = export_frame(df_display[display_cols]).to_csv(index=False).encode("utf-8-sig")
+            csv = export_frame(df_display[display_cols]).to_csv(index=False).encode("utf-8-sig")
 
-        st.download_button(
+            st.download_button(
 
-            "⬇️ 匯出指派結果 (assigned_results.csv)",
+                "⬇️ 匯出指派結果 (assigned_results.csv)",
 
-            csv,
+                csv,
 
-            file_name="assigned_results.csv",
+                file_name="assigned_results.csv",
 
-            mime="text/csv",
+                mime="text/csv",
 
-        )
+            )
 
         # ==========================================
 
@@ -3245,14 +3287,102 @@ if "last_result" in st.session_state:
     # 前一服務延遲事件
     st.session_state.setdefault("delay_event_context", None)
 
+    st.session_state['_workflow_cg_labels'] = {str(x):caregiver_label(str(x)) for x in res['df_cg']['居服員ID']}
+    st.session_state['_workflow_cl_labels'] = {str(k):str(v)+'｜'+str(k) for k,v in (_client_names if _show_names else {}).items()}
+    if st.session_state.get('workflow_notice'):
+        st.success(st.session_state.pop('workflow_notice'))
+
+    def _workflow_frames():
+        tasks = df_tasks.copy()
+        effective = apply_overrides_to_result(df_result, overrides)
+        for item in st.session_state.get('dynamic_insertions', []):
+            tid = str(item['task']['任務ID'])
+            if tid not in set(tasks['任務ID'].astype(str)):
+                tasks = pd.concat([tasks, pd.DataFrame([item['task']])], ignore_index=True)
+            effective = effective[effective['任務ID'].astype(str) != tid] if '任務ID' in effective else effective
+            if item.get('cg_id'):
+                effective = pd.concat([effective, pd.DataFrame([{'任務ID':tid,'派單居服員':item['cg_id']}])],ignore_index=True)
+        for pending in _workflow_store.pending():
+            if str(pending['任務ID']) not in set(tasks['任務ID'].astype(str)):
+                tasks=pd.concat([tasks,pd.DataFrame([pending])],ignore_index=True)
+        return tasks, effective
+
+    def _workflow_assign(tid, cg, reason):
+        tasks, effective = _workflow_frames()
+        error = check_reassignment_conflict(tid, cg, tasks, effective, res['df_cg'], config, date_column='日期', df_cl=res.get('df_cl')) if cg is not None else None
+        if error: return error
+        for item in st.session_state.get('dynamic_insertions', []):
+            if str(item['task']['任務ID']) == str(tid):
+                save_override_log(tid,item['task'].get('案家ID',''),item.get('cg_id'),cg,reason)
+                item['cg_id'] = cg
+                return None
+        for pending in _workflow_store.pending():
+            if str(pending['任務ID'])==str(tid):
+                if cg:
+                    st.session_state['dynamic_insertions'].append({'task':pending,'cg_id':cg,'candidate_rank':1,'candidate_detail':{},'manual_reason':reason})
+                    _workflow_store.remove_pending(tid)
+                return None
+        if cg is None:
+            overrides[tid]={'cg_id':None,'reason':reason}
+            save_override_log(tid,tasks.loc[tasks['任務ID'].astype(str)==str(tid),'案家ID'].iloc[0],assigned_map.get(tid),None,reason)
+            return None
+        return _quick_reassign(tid, cg, reason, apply_scope='僅本次')
+
+    def _workflow_rank(tid, people):
+        tasks, effective = _workflow_frames()
+        return rank_candidates_by_availability(tid,people,tasks,effective,res['df_cg'],config,date_column='日期',df_cl=res.get('df_cl'))
+
+    def _workflow_slots(task):
+        tasks, effective = _workflow_frames()
+        merged = merge_task_client_tables(tasks,res.get('df_cl',pd.DataFrame()))
+        row = merged[merged['任務ID'].astype(str)==str(task['任務ID'])].iloc[0]
+        effective = effective[effective['任務ID'].astype(str)!=str(task['任務ID'])]
+        proposals=[]
+        for offset in [-30,30,-60,60]:
+            candidate=row.copy()
+            start=pd.Timestamp(str(row['日期'])[:10]+' '+str(row['時間窗_開始'])[:5])+pd.Timedelta(minutes=offset)
+            end=pd.Timestamp(str(row['日期'])[:10]+' '+str(row['時間窗_結束'])[:5])+pd.Timedelta(minutes=offset)
+            if start.date()!=pd.Timestamp(row['日期']).date() or end.date()!=start.date() or start.hour<8 or end>start.normalize()+pd.Timedelta(hours=21):continue
+            candidate['時間窗_開始']=start.strftime('%H:%M');candidate['時間窗_結束']=end.strftime('%H:%M')
+            options=find_insertion_candidates(candidate,merged,effective,res['df_cg'],config,top_n=2,date_column='日期')
+            for _,option in options.iterrows():
+                if option.get('可直接插入'):
+                    proposals.append({'task_id':str(row['任務ID']),'cg_id':str(option['居服員ID']),'date':start.date().isoformat(),'start':start.strftime('%H:%M'),'end':end.strftime('%H:%M')})
+        return proposals
+
+    def _workflow_move(draft, reason, scope):
+        tasks,effective = _workflow_frames()
+        tid=str(draft['task_id']); proposed=tasks.copy();mask=proposed['任務ID'].astype(str)==tid
+        for col,key in [('日期','date'),('時間窗_開始','start'),('時間窗_結束','end')]:proposed.loc[mask,col]=draft[key]
+        error=check_reassignment_conflict(tid,draft['cg_id'],proposed,effective,res['df_cg'],config,date_column='日期',df_cl=res.get('df_cl'))
+        if error:return error
+        for item in st.session_state.get('dynamic_insertions',[]):
+            if str(item['task']['任務ID'])==tid:
+                item['task'].update({'日期':draft['date'],'時間窗_開始':draft['start'],'時間窗_結束':draft['end']})
+                item['cg_id']=draft['cg_id']
+                return None
+        for pending in _workflow_store.pending():
+            if str(pending['任務ID'])==tid:
+                pending.update({'日期':draft['date'],'時間窗_開始':draft['start'],'時間窗_結束':draft['end']})
+                st.session_state['dynamic_insertions'].append({'task':pending,'cg_id':draft['cg_id'],'candidate_rank':1,'candidate_detail':{},'manual_reason':reason})
+                _workflow_store.remove_pending(tid)
+                return None
+        return _calendar_move(draft,reason,scope)
+
+    if st.session_state.pop('workflow_go_queue',False):
+        st.session_state['dynamic_event_type_selector']='📋 接單與待辦'
+
     _dynamic_event_type = st.radio(
         "選擇事件類型",
-        ["➕ 臨時新增案件", "🚨 居服員臨時請假", "🕒 案家臨時改期", "⏱️ 前一服務延遲"],
+        ["📋 接單與待辦", "➕ 臨時新增案件", "🚨 居服員臨時請假", "🕒 案家臨時改期", "⏱️ 前一服務延遲"],
         horizontal=True,
         key="dynamic_event_type_selector",
     )
 
-    if _dynamic_event_type == "➕ 臨時新增案件":
+    if _dynamic_event_type == "📋 接單與待辦":
+        _wf_tasks, _wf_result = _workflow_frames()
+        render_queue(_workflow_store,_wf_tasks,_wf_result,res['df_cg'],overrides,_workflow_assign,_workflow_rank,_workflow_move,_workflow_slots)
+    elif _dynamic_event_type == "➕ 臨時新增案件":
         with st.expander("➕ 建立臨時新增案件", expanded=False):
             _service_master = st.session_state["edit_service_code"].copy()
             _service_codes = [
@@ -3605,6 +3735,11 @@ if "last_result" in st.session_state:
                         st.session_state["dynamic_candidate_result"] = _candidate_df
                         st.session_state["dynamic_candidate_task"] = _temp_merged.iloc[0].to_dict()
                         st.session_state["dynamic_candidate_raw_message"] = dynamic_raw_message
+                        if _candidate_df.empty or not _candidate_df['可直接插入'].any():
+                            _pending_task = _temp_merged.iloc[0].to_dict()
+                            if str(_pending_task['任務ID']) not in set(df_tasks['任務ID'].astype(str)) and not any(str(x['task']['任務ID'])==str(_pending_task['任務ID']) for x in st.session_state['dynamic_insertions']):
+                                _workflow_store.save_pending(_pending_task)
+                                st.info('未找到可派人選，已加入「接單與待辦」，可檢查原因、備援人力或協商時段。')
                     except Exception as e:
                         st.session_state["dynamic_candidate_result"] = None
                         st.session_state["dynamic_candidate_task"] = None
@@ -3798,6 +3933,7 @@ if "last_result" in st.session_state:
                                 "既有任務未被移動，並已建立稽覈紀錄。"
                             )
 
+                            _workflow_store.remove_pending(_task_id)
                             # 清掉待確認狀態，避免 rerun 後重複確認。
                             for _k in [
                                 "dynamic_candidate_result",
@@ -3831,292 +3967,8 @@ if "last_result" in st.session_state:
             show_table(pd.DataFrame(_insert_rows), width="stretch", hide_index=True)
 
     elif _dynamic_event_type == "🚨 居服員臨時請假":
-        # ==========================================
-        st.subheader("🚨 居服員臨時請假")
-        st.caption(
-            "指定請假居服員與日期後，系統會找出該日受影響任務，"
-            "把這些任務暫時視為未派單，再逐筆重新尋找可直接插入的 Top 3 候選人。"
-            "其他既有班表不移動。"
-        )
-
-        _effective_result_for_leave = apply_overrides_to_result(df_result, overrides)
-
-        # 日期只取目前任務資料中實際存在的日期
-        _leave_date_options = []
-        if "日期" in df_tasks.columns:
-            _leave_date_series = pd.to_datetime(df_tasks["日期"], errors="coerce").dropna()
-            _leave_date_options = sorted({d.date() for d in _leave_date_series})
-
-        if not _leave_date_options:
-            st.info("目前班表沒有可用的日期資料，請先執行含日期的排程。")
-        else:
-            _leave_date = st.selectbox(
-                "請假日期",
-                _leave_date_options,
-                format_func=lambda d: pd.Timestamp(d).strftime("%Y-%m-%d"),
-                key="leave_event_date",
-            )
-
-            # 找出該日實際有被派班的居服員，讓督導不用從全部員工中找
-            _task_date_map = (
-                df_tasks[["任務ID", "日期"]]
-                .assign(_date_norm=lambda x: pd.to_datetime(x["日期"], errors="coerce").dt.date)
-            )
-            _result_with_date = _effective_result_for_leave.merge(
-                _task_date_map[["任務ID", "_date_norm"]],
-                on="任務ID",
-                how="left",
-            )
-            _assigned_on_leave_date = _result_with_date[
-                _result_with_date["_date_norm"] == _leave_date
-            ].copy()
-
-            _leave_cg_options = sorted(
-                {
-                    str(v)
-                    for v in _assigned_on_leave_date.get("派單居服員", pd.Series(dtype=object)).dropna().tolist()
-                    if str(v).strip() and str(v).strip() != "未指派"
-                }
-            )
-
-            if not _leave_cg_options:
-                st.info("這一天目前沒有已指派的居服員。")
-            else:
-                _leave_cg = st.selectbox(
-                    "請假的居服員",
-                    _leave_cg_options,
-                    key="leave_event_caregiver",
-                    format_func=caregiver_label,
-                )
-
-                if st.button(
-                    "🔎 找出受影響任務並重新找候選人",
-                    type="primary",
-                    key="leave_event_analyze",
-                ):
-                    try:
-                        # 找出該居服員在該日目前實際負責的任務
-                        _affected_result = _assigned_on_leave_date[
-                            _assigned_on_leave_date["派單居服員"].astype(str) == str(_leave_cg)
-                        ].copy()
-                        _affected_task_ids = _affected_result["任務ID"].astype(str).tolist()
-
-                        if not _affected_task_ids:
-                            st.session_state["leave_event_analysis"] = {
-                                "date": _leave_date,
-                                "absent_cg": _leave_cg,
-                                "items": [],
-                            }
-                        else:
-                            # 完整任務資料：任務 + 案家條件
-                            _current_tasks_for_leave = merge_task_client_tables(df_tasks, res.get("df_cl", pd.DataFrame()))
-
-                            # 請假者當日受影響任務先全部從「既有指派」移除，
-                            # 這樣每一筆才能以真正待補班的狀態重新做 insertion。
-                            _base_result_without_affected = _effective_result_for_leave[
-                                ~_effective_result_for_leave["任務ID"].astype(str).isin(_affected_task_ids)
-                            ].copy()
-
-                            # 候選池直接排除請假本人
-                            _df_cg_leave = res.get("df_cg", pd.DataFrame()).copy()
-                            if "居服員ID" in _df_cg_leave.columns:
-                                _df_cg_leave = _df_cg_leave[
-                                    _df_cg_leave["居服員ID"].astype(str) != str(_leave_cg)
-                                ].copy()
-
-                            _leave_items = []
-
-                            for _task_id in _affected_task_ids:
-                                _task_match = _current_tasks_for_leave[
-                                    _current_tasks_for_leave["任務ID"].astype(str) == str(_task_id)
-                                ]
-                                if _task_match.empty:
-                                    _leave_items.append({
-                                        "task_id": _task_id,
-                                        "task": {},
-                                        "candidates": pd.DataFrame(),
-                                        "error": "找不到原任務資料",
-                                    })
-                                    continue
-
-                                _task_row = _task_match.iloc[0].copy()
-
-                                try:
-                                    _cand = find_insertion_candidates(
-                                        _task_row,
-                                        _current_tasks_for_leave,
-                                        _base_result_without_affected,
-                                        _df_cg_leave,
-                                        config,
-                                        top_n=3,
-                                        date_column="日期",
-                                    )
-                                    _leave_items.append({
-                                        "task_id": _task_id,
-                                        "task": _task_row.to_dict(),
-                                        "candidates": _cand,
-                                        "error": "",
-                                    })
-                                except Exception as _leave_err:
-                                    _leave_items.append({
-                                        "task_id": _task_id,
-                                        "task": _task_row.to_dict(),
-                                        "candidates": pd.DataFrame(),
-                                        "error": str(_leave_err),
-                                    })
-
-                            st.session_state["leave_event_analysis"] = {
-                                "date": _leave_date,
-                                "absent_cg": _leave_cg,
-                                "items": _leave_items,
-                            }
-
-                    except Exception as e:
-                        st.session_state["leave_event_analysis"] = None
-                        st.error(f"無法分析居服員請假事件：{e}")
-
-                _leave_analysis = st.session_state.get("leave_event_analysis")
-
-                if (
-                    isinstance(_leave_analysis, dict)
-                    and _leave_analysis.get("date") == _leave_date
-                    and str(_leave_analysis.get("absent_cg")) == str(_leave_cg)
-                ):
-                    _leave_items = _leave_analysis.get("items", [])
-
-                    if not _leave_items:
-                        st.warning("找不到這位居服員在所選日期的受影響任務。")
-                    else:
-                        st.success(
-                            f"找到 {len(_leave_items)} 筆受影響任務。"
-                            "以下每一筆都已獨立重新計算可直接插入的候選人。"
-                        )
-
-                        _affected_summary = []
-                        for _item in _leave_items:
-                            _t = _item.get("task", {})
-                            _affected_summary.append({
-                                "任務ID": _item.get("task_id"),
-                                "案家ID": _t.get("案家ID"),
-                                "日期": _t.get("日期"),
-                                "服務時段": f"{_t.get('時間窗_開始', '')}-{_t.get('時間窗_結束', '')}",
-                                "原派居服員": _leave_cg,
-                                "服務歷時(分鐘)": _t.get("服務歷時(分鐘)"),
-                            })
-                        show_table(
-                            pd.DataFrame(_affected_summary),
-                            width="stretch",
-                            hide_index=True,
-                        )
-
-                        for _item_index, _item in enumerate(_leave_items, start=1):
-                            _task_id = str(_item.get("task_id"))
-                            _task = _item.get("task", {})
-                            _cand_df = _item.get("candidates")
-                            _err = _item.get("error", "")
-
-                            with st.expander(
-                                f"受影響任務 {_item_index}｜{_task_id}｜"
-                                f"{_task.get('時間窗_開始', '')}-{_task.get('時間窗_結束', '')}",
-                                expanded=True,
-                            ):
-                                if _err:
-                                    st.error(f"候選人計算失敗：{_err}")
-                                    continue
-
-                                if not isinstance(_cand_df, pd.DataFrame) or _cand_df.empty:
-                                    st.warning("目前沒有候選人結果。")
-                                    continue
-
-                                _available = _cand_df[
-                                    _cand_df["可直接插入"] == True
-                                ].copy()
-
-                                if _available.empty:
-                                    st.warning(
-                                        "目前沒有可直接接手的人選。"
-                                        "此任務之後可進入局部重排流程。"
-                                    )
-                                    show_table(_cand_df, width="stretch", hide_index=True)
-                                    continue
-
-                                _top3 = _available.head(3).copy()
-                                show_table(_top3, width="stretch", hide_index=True)
-
-                                st.markdown("**督導選擇接手人員**")
-                                _top1 = str(_top3.iloc[0]["居服員ID"])
-
-                                for _rank, (_idx, _cand) in enumerate(_top3.iterrows(), start=1):
-                                    _new_cg = str(_cand.get("居服員ID", ""))
-                                    _score = _cand.get(
-                                        "適配度分數",
-                                        _cand.get("適配分數", None),
-                                    )
-                                    _cost = _cand.get("擾動成本", 0)
-                                    _prev_slot = str(_cand.get("前一任務（結束）", "無"))
-                                    _next_slot = str(_cand.get("下一任務（開始）", "無"))
-
-                                    _left, _right = st.columns([4, 1])
-                                    _label = f"候選 {_rank}｜{caregiver_label(_new_cg)}"
-                                    if pd.notna(_score):
-                                        _label += f"｜適配分數 {float(_score):.1f}"
-                                    _label += f"｜擾動成本 {_cost}"
-                                    _left.markdown(_label)
-                                    _left.caption(
-                                        f"🕒 前一任務 {_prev_slot} → 本次服務 → 下一任務 {_next_slot}"
-                                    )
-
-                                    if _right.button(
-                                        "✅ 改派給此人",
-                                        key=f"leave_assign_{_leave_date}_{_leave_cg}_{_task_id}_{_rank}_{_new_cg}",
-                                        width="stretch",
-                                    ):
-                                        _reason = f"居服員臨時請假：{_leave_cg}"
-                                        _conflict_msg = _quick_reassign(
-                                            _task_id,
-                                            _new_cg,
-                                            _reason,
-                                        )
-
-                                        if _conflict_msg:
-                                            st.error(_conflict_msg)
-                                        else:
-                                            _confirmed_at = pd.Timestamp.now()
-                                            _top3_ids = " > ".join(
-                                                _top3["居服員ID"].astype(str).tolist()
-                                            )
-
-                                            st.session_state["dynamic_adjustment_log"].append(
-                                                {
-                                                    "時間戳記": _confirmed_at,
-                                                    "事件類型": "居服員臨時請假",
-                                                    "任務ID": _task_id,
-                                                    "案家ID": _task.get("案家ID"),
-                                                    "日期": _task.get("日期"),
-                                                    "服務時段": (
-                                                        f"{_task.get('時間窗_開始', '')}-"
-                                                        f"{_task.get('時間窗_結束', '')}"
-                                                    ),
-                                                    "請假居服員": _leave_cg,
-                                                    "系統Top3": _top3_ids,
-                                                    "系統第一名": _top1,
-                                                    "最終選擇居服員": _new_cg,
-                                                    "最終候選排名": _rank,
-                                                    "是否人工改選": "是" if _rank > 1 else "否",
-                                                    "既有班表是否移動": "否",
-                                                    "擾動成本": _cand.get("擾動成本", 0),
-                                                    "事件備註": "請假任務逐筆重新插入",
-                                                }
-                                            )
-
-                                            st.success(
-                                                f"✅ {_task_id} 已由 {_leave_cg} 改派給 {_new_cg}。"
-                                            )
-                                            # 改派後原候選結果可能已過期，要求重新分析剩餘任務。
-                                            st.session_state["leave_event_analysis"] = None
-                                            st.rerun()
-
-        # ==========================================
+        _wf_tasks, _wf_result = _workflow_frames()
+        render_leave(_workflow_store, res['df_cg'], _wf_tasks, _wf_result, overrides)
 
     elif _dynamic_event_type == "🕒 案家臨時改期":
         # ==========================================
@@ -5016,7 +4868,7 @@ if "last_result" in st.session_state:
                     hide_index=True,
                 )
 
-    st.subheader("📄 最終派單結果（含居督覆寫）")
+    st.subheader("📄 服務班表（目前有效派單）")
 
     has_date_for_final = "日期" in df_tasks.columns
 
@@ -5090,6 +4942,7 @@ if "last_result" in st.session_state:
 
             "預估居服員拆帳薪資": ai_row["預估居服員拆帳薪資"] if ai_row is not None else None,
 
+            "接單狀態": _workflow_store.record(task_row, final_cg, str(t_id) in overrides)["state"],
             "備註": change_note,
 
         })
@@ -5115,6 +4968,7 @@ if "last_result" in st.session_state:
                     else _item.get("system_top1_id", _item["cg_id"])
                 ),
                 "最終派單居服員": _item["cg_id"],
+                "接單狀態": _workflow_store.record(_t,_item.get("cg_id"),True)["state"],
                 "適配分數": _item.get("candidate_detail", {}).get(
                     "適配度分數",
                     _item.get("candidate_detail", {}).get("適配分數"),
@@ -5132,9 +4986,41 @@ if "last_result" in st.session_state:
         )
         final_rows.append(_dynamic_row)
 
-    df_final = pd.DataFrame(final_rows)
-
-    show_table(df_final, width="stretch", hide_index=True)
+    df_final = build_schedule_output(travel_tasks, _operational_assignments, res['df_cg'],
+        df_route_result, metadata=pd.DataFrame(final_rows), buffer_mins=config.buffer_mins)
+    st.caption('沿用週服務計畫欄位，加入派單居服員與逐段交通。交通時間為估計分鐘，原檔的0不當成實測；空白表示尚未計算。姓名依上方「顯示姓名」設定呈現。')
+    _filter_date, _filter_cg, _filter_case = st.columns([1, 1, 2])
+    _date_options = ['全部日期'] + sorted(df_final['日期'].dropna().astype(str).unique().tolist())
+    _cg_options = ['全部居服員'] + sorted(df_final['派單居服員'].dropna().astype(str).unique().tolist())
+    _selected_date = _filter_date.selectbox('日期', _date_options, key='output_filter_date')
+    _selected_cg = _filter_cg.selectbox('居服員', _cg_options,
+        format_func=lambda value: caregiver_label(value) if value != '全部居服員' else value, key='output_filter_cg')
+    _search_case = _filter_case.text_input('搜尋案號、案家姓名或任務ID', key='output_filter_case').strip()
+    _visible = df_final.copy()
+    if _selected_date != '全部日期':
+        _visible = _visible.loc[_visible['日期'].astype(str).eq(_selected_date)]
+    if _selected_cg != '全部居服員':
+        _visible = _visible.loc[_visible['派單居服員'].astype(str).eq(_selected_cg)]
+    if _search_case:
+        _case_text = _visible['案號'].astype(str) + ' ' + _visible['任務ID'].astype(str)
+        if _show_names:
+            _case_text += ' ' + _visible['案號'].map(_client_names).fillna('')
+        _visible = _visible.loc[_case_text.str.contains(_search_case, case=False, regex=False)]
+    _full_columns = st.checkbox('顯示週服務計畫與交通完整欄位', key='output_full_columns')
+    _full_view_columns = MAIN_COLUMNS + [col for col in ['狀態', '服務時數', '費用類型', '頻率', '生效日', '到期日',
+        '交通估算來源', '交通查詢方式', '交通查詢時間', '轉場時段檢查', '備註', '待確認事項'] if col in _visible and col not in MAIN_COLUMNS]
+    show_table(_visible[_full_view_columns if _full_columns else MAIN_COLUMNS], width='stretch', hide_index=True,
+        column_config={
+            '案號': st.column_config.TextColumn('案家（案號／姓名）', width='medium'),
+            '派單居服員': st.column_config.TextColumn('居服員（編號／姓名）', width='medium'),
+            '交通時間': st.column_config.NumberColumn('交通時間（分）', format='%.2f', help='估計交通，不含轉場緩衝；空白表示未計算。'),
+            '出發地': st.column_config.TextColumn('出發地', width='large'),
+            '服務項目': st.column_config.TextColumn('服務項目', width='medium'),
+        })
+    st.caption(f'目前顯示 {len(_visible)} 筆／共 {len(df_final)} 筆；下載包含全部班表，交通細節與座標放在「逐段交通」工作表。')
+    st.download_button('⬇️ 下載服務班表 Excel（含逐段交通）',
+        schedule_excel_bytes(export_frame(df_final)), '服務班表_含交通.xlsx',
+        'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', key='download_schedule_excel')
 
     csv_final = export_frame(df_final).to_csv(index=False).encode("utf-8-sig")
 

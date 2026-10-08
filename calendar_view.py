@@ -121,7 +121,7 @@ export default function({parentElement,data,setStateValue}) {
       card.style.top=(Math.max(0,(begin-first)/step*px)+2)+'px';card.style.height=Math.max(30,(Math.min(last,end)-Math.max(first,begin))/step*px-4)+'px';
       card.title=[row.client_label,row.start+'–'+row.end,row.code,row.tag,row.cg_label].join('｜');card.setAttribute('aria-label',card.title);
       const title=el('strong','',row.client_label);card.appendChild(title);
-      card.appendChild(el('span','cf-event-time',row.start+'–'+row.end+' · '+row.tag));
+      card.appendChild(el('span','cf-event-time',row.start+'–'+row.end+' · '+(row.workflow_state||row.tag)));
       card.appendChild(el('span','cf-event-code',row.code));
       card.appendChild(el('span','cf-event-person',row.cg_label));
       const details=el('button','cf-details','詳情');details.type='button';details.onclick=e=>{e.stopPropagation();emit('select',{task_id:row.id})};card.appendChild(details);
@@ -236,7 +236,7 @@ def _assignment_dialog(row, labels, on_list_candidates, can_reassign, can_move=F
         info = status.get(cg)
         if info is None:
             return labels[cg] + " · 尚未檢查"
-        return labels[cg] + (" · 可派" if info.get("available") else " · " + str(info.get("detail") or "不符合條件"))
+        return labels[cg] + (" · " + str(info.get("detail") or ("可派" if info.get("available") else "不符合條件")))
     choice = st.selectbox("指定居服員", choices, index=choices.index(row["cg"]) if row["cg"] in choices else None, placeholder="搜尋或選擇居服員", format_func=option_label, key="cf_dialog_cg_" + task_id)
     st.caption("可直接選人；按『確認安排』時仍會重新檢查是否可派。")
     scope = st.radio("套用範圍", ["僅本次", "後續同週期服務"], horizontal=True, key="cf_dialog_scope_" + task_id)
@@ -301,6 +301,11 @@ def render_calendar_overview(result, tasks, caregivers, overrides=None, on_reass
                              on_list_candidates=None, on_move=None, client_names=None, caregiver_names=None, **kwargs):
     _process_assignment_request(on_reassign, on_move)
     rows, labels = build_schedule_rows(result, tasks, caregivers, overrides, client_names, caregiver_names)
+    workflow = kwargs.get('workflow_store')
+    if workflow:
+        task_map = {str(t['任務ID']): t for _,t in tasks.iterrows()}
+        for row in rows:
+            row['workflow_state'] = workflow.record(task_map[row['id']],row['cg'],row['id'] in (overrides or {}))['state']
     st.markdown("### 班表工作台")
     if any(r["client_label"].startswith("姓名未對照｜") for r in rows) or any(v.startswith("姓名未對照｜") for v in labels.values()):
         st.info("部分姓名尚未顯示。請在『個資顯示設定』開啟姓名，並確認 Excel 的『案家姓名對照』與『居服員姓名對照』包含對應 ID。")
