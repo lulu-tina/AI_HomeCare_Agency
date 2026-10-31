@@ -1,0 +1,601 @@
+From 37358b26dbf33c0a757db83b184848a7069d3a10 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Sat, 31 Oct 2026 21:41:21 +0800
+Subject: [PATCH] =?UTF-8?q?=E8=B3=87=E6=A0=BC=E9=87=8D=E6=96=B0=E6=AA=A2?=
+ =?UTF-8?q?=E6=A0=B8=E6=94=B9=E7=82=BA=E5=8F=AA=E6=B4=BE=E6=9C=89=E8=A8=93?=
+ =?UTF-8?q?=E7=B7=B4=E8=80=85=EF=BC=9B=E6=96=B0=E5=A2=9E=E5=80=8B=E8=B3=87?=
+ =?UTF-8?q?=E8=88=87=E8=B3=87=E6=96=99=E6=B2=BB=E7=90=86=E8=A8=AD=E8=A8=88?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01FJsjsBW5xXD8Ts6kairTEc
+---
+ DATA_GOVERNANCE.md                  | 153 ++++++++++++++++++++++++++++
+ README.md                           |  28 +++--
+ app.py                              |  62 +++++------
+ qualification_recheck.py            |  81 ++++++++-------
+ tests/test_qualification_recheck.py |  22 ++--
+ 5 files changed, 260 insertions(+), 86 deletions(-)
+ create mode 100644 DATA_GOVERNANCE.md
+
+diff --git a/DATA_GOVERNANCE.md b/DATA_GOVERNANCE.md
+new file mode 100644
+index 0000000..3bc5a46
+--- /dev/null
++++ b/DATA_GOVERNANCE.md
+@@ -0,0 +1,153 @@
++# CareFlow 個資與資料治理設計
++
++適用範圍：CareFlow 居服排班系統（Streamlit 介面、排班引擎、交通查詢、自動存檔、匯出檔）。
++本系統會處理案家地址與座標、照護服務內容（服務碼、是否失智、BA08 等）、居服員工時與證照，
++其中失智、足部照護、管灌等照護需求屬**健康相關資料**，依《個人資料保護法》第 6 條屬特種個資，
++並受《長期照顧服務法》對長照人員業務保密義務的規範。以下分「設計原則／現況」與「待補項目」兩欄，
++現況欄只寫程式已實作的部分，待補欄是上線前要完成的。
++
++---
++
++## 一、資料盤點與分級
++
++| 等級 | 資料 | 來源 | 用途 | 系統內存放位置 |
++|---|---|---|---|---|
++| **L3 敏感** | 案家姓名、居服員姓名 | 機構 Excel 姓名對照工作表 | 僅畫面辨識 | 只在記憶體（session），匯入即遮罩為「王○○」 |
++| **L3 敏感** | 健康照護需求：是否失智、CMS 等級、特殊照護需求、服務碼（BA08、BA17 等）、重度移位 | 機構 Excel「個案資料」「週服務計畫」 | 資格比對、工作強度 | 記憶體；自動存檔資料庫 |
++| **L3 敏感** | 案家地址、門牌座標 | 機構 Excel、LINE 派案訊息 | 交通時間、離家距離 | 記憶體；自動存檔資料庫；路段快取（只有座標） |
++| **L2 內部** | 居服員工時、加班、請假、證照與到期日、薪資估算 | 機構 Excel、居督輸入 | 排班限制、工資估算 | 記憶體；自動存檔資料庫；匯出檔 |
++| **L2 內部** | 班表（任務ID↔居服員ID↔時段） | 系統產生 | 派案 | 記憶體；自動存檔；匯出檔 |
++| **L1 一般** | 系統設定、路網版本、交通快取時間 | 系統 | 營運 | 設定檔、快取資料庫 |
++
++原則：**系統以 ID 運算**（案家ID、居服員ID、任務ID），姓名只在顯示層對照；不收身分證字號、電話、生日、病名診斷全文，
++Excel 若含這些欄位，匯入時不讀取。
++
++---
++
++## 二、角色權限（RBAC）
++
++| 功能／資料 | 機構負責人 | 居督（個管） | 排班助理 | 居服員 | 系統維運 | 評鑑／稽核（唯讀） |
++|---|---|---|---|---|---|---|
++| 匯入機構 Excel | ✅ | ✅ | ✅ | ❌ | ❌ | ❌ |
++| 看遮罩姓名＋ID | ✅ | ✅ | ✅ | 僅自己與自己的案家 | ❌（只看 ID） | ✅ |
++| 看健康照護需求（失智、BA08…） | ✅ | ✅ | 僅「需要的資格」，不看原因 | 僅自己服務的案家 | ❌ | ✅ |
++| 看案家完整地址 | ✅ | ✅ | ❌（看到區＋路名） | 僅自己服務的案家、服務當日 | ❌ | ✅ |
++| 執行排班、改派、資格重新檢核 | ✅ | ✅ | ✅（改派需居督核准） | ❌ | ❌ | ❌ |
++| 覆寫 AI 推薦、固定人選 | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ |
++| 看工資估算、加班 | ✅ | ✅ | ❌ | 僅自己 | ❌ | ✅ |
++| 匯出（代碼版） | ✅ | ✅ | ✅ | ❌ | ❌ | ✅ |
++| 匯出（遮罩姓名版） | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ |
++| 刪除存檔、執行資料銷毀 | ✅（雙人覆核） | ❌ | ❌ | ❌ | 執行，不可單獨發動 | ❌ |
++| 看稽核紀錄 | ✅ | 僅自己的操作 | ❌ | ❌ | 系統事件 | ✅ |
++| 管理 API 金鑰、主機設定 | ❌ | ❌ | ❌ | ❌ | ✅ | ❌ |
++
++- **現況**：部署用 Caddy basic auth，只有一組 `supervisor` 帳號；自動存檔也沒有登入，同一台主機同一份 Excel 會看到同一份進度（`session_store.py` 已註明為試用期限制）。
++- **待補**：改為個人帳號（機構 SSO 或帳密＋雙因素），角色存在帳號上；上表用「最小權限」預設，額外權限要由機構負責人核准並留紀錄；居服員離職當日停用帳號；每季複核一次帳號與角色。
++
++---
++
++## 三、資料最小化
++
++| 項目 | 現況（已實作） | 待補 |
++|---|---|---|
++| 姓名 | 匯入即遮罩（王O明→王○○），只存 session 顯示用；排班、OR-Tools、Google、OSRM、稽核 log 都只用 ID | — |
++| 匯出 | 預設「代碼版」，遮罩姓名版需手動選 | 遮罩姓名版限居督以上角色 |
++| LINE 派案訊息 | 解析後立即清掉原文，不留畫面與 session（示範訊息除外） | 解析結果只保留找人需要的欄位（區域、時段、服務碼、性別需求），概況簡述不保存 |
++| 地址 | 門牌定位離線完成（`address_geocoder.py`，不連網） | 座標只保留到門牌點；顯示給排班助理時只顯示區＋路名 |
++| 健康資料 | 排班只用「需要哪種資格」的布林／代碼 | 介面對排班助理只顯示「需失智訓練」，不顯示評估內容 |
++| 交通查詢 | Google Routes 只收座標、時間、交通模式；OSRM 只收座標 | 送出前去掉順序關聯（不按同一位居服員的路線順序成批送），降低可推回行程的風險 |
++| 路段快取 | 只存「起訖座標→分鐘數」，不存日期與任何 ID | — |
++| 自動存檔 | 畫面暫存欄位不存 | 存檔前剔除姓名對照；資料庫加密（SQLCipher 或磁碟加密） |
++
++---
++
++## 四、保存與刪除期限
++
++| 資料 | 存放 | 保存期限 | 到期處理 |
++|---|---|---|---|
++| 姓名對照 | 記憶體 | 關閉頁面／session 結束 | 自動消失 |
++| 自動存檔（`output_results/dispatch_workflow.sqlite3`） | 主機 | 每個範圍保留最新 5 份（現況）；**另加**：最後修改後 90 天 | 每日排程刪除逾期列並 `VACUUM`；該排班期結案匯出後即可手動清除 |
++| 路段快取（`road_legs.sqlite3`） | 主機 | 30 天（`CAREFLOW_ROAD_CACHE_DAYS`，現況只在讀取時忽略） | 待補：每日實際刪除逾期列 |
++| 臨時異動紀錄、資格追蹤、居督覆寫紀錄（`supervisor_override_log.csv`） | 主機／匯出 | 依機構服務紀錄保存規定與縣市契約（建議與服務紀錄同期限），系統內最多保留至當年度評鑑完成 | 匯出歸檔到機構正式紀錄系統後，從主機刪除 |
++| 匯出檔（班表、未派原因、工資估算） | 使用者電腦 | 依機構文件管理規範 | 由機構管理；檔名加日期與「內部」標示 |
++| 上傳的原始 Excel | 記憶體；自動存檔內含檔案位元組 | 隨自動存檔期限 | 同上 |
++| 存取稽核紀錄 | 主機（只能附加） | 至少 2 年，或依主管機關要求 | 到期後由機構負責人核准刪除，刪除動作本身留紀錄 |
++| 離職居服員、結案案家 | 機構 Excel | 由機構 Excel 決定，系統不另存主檔 | 下次匯入時自然排除；自動存檔隨期限刪除 |
++
++刪除方式：資料庫列刪除後 `VACUUM`；備份依同一期限輪替，備份不可比正本保存更久。每次批次刪除記錄筆數、時間、執行者。
++
++---
++
++## 五、存取稽核
++
++**現況**：居督覆寫 AI 推薦時寫入 `supervisor_override_log.csv`（時間、任務ID、案家ID、AI推薦、居督指定、原因）；臨時異動與資格重新檢核寫入 session 的調整紀錄並可匯出；都只用 ID。
++
++**待補設計**：
++
++| 要記錄的事件 | 欄位 |
++|---|---|
++| 登入、登出、登入失敗 | 時間、帳號、角色、來源 IP、結果 |
++| 匯入 Excel | 時間、帳號、檔案雜湊（不存檔名中的姓名）、筆數 |
++| 開啟「顯示遮罩姓名」、查看完整地址 | 時間、帳號、案家ID |
++| 改派、覆寫、資格重新檢核、固定人選變更 | 時間、帳號、任務ID／案家ID、前後值、原因 |
++| 匯出（代碼版／遮罩姓名版） | 時間、帳號、匯出種類、筆數 |
++| 刪除存檔、批次銷毀 | 時間、執行者、核准者、筆數 |
++| 金鑰更換、主機設定變更 | 時間、維運帳號、變更項目 |
++
++- 稽核紀錄只能附加、不能修改；每筆帶前一筆的雜湊（hash chain），每日把當天最後雜湊另存，用來證明沒被竄改。
++- 稽核紀錄本身不含姓名、地址、健康資料，只用 ID。
++- 自動警示：同一帳號短時間大量匯出、非上班時段查看大量完整地址、連續登入失敗。
++- 機構負責人每月抽查一次；評鑑時可提供唯讀匯出。
++
++---
++
++## 六、第三方服務與資料流
++
++| 第三方 | 送出的資料 | 不送出的資料 | 控制措施 |
++|---|---|---|---|
++| **Google Routes API**（大眾運輸時間） | 起訖座標、出發時間、交通模式 | 姓名、ID、服務內容、健康資料 | 金鑰放環境變數／Streamlit secrets，不進程式碼與 Git；Google Cloud 限制金鑰只能呼叫 Routes API、設 IP 限制與每日額度；介面有查詢次數上限 |
++| **OSRM 機車路網**（目前架在 Render 的自建主機） | 起訖座標 | 時間、姓名、ID | 主機只開路網查詢、不記 request log；可改機構自有主機（`CAREFLOW_OSRM_MOTORCYCLE_HOST`）或本機版，完全不出網 |
++| **雲端託管**（Streamlit Community Cloud／自建 Docker＋Caddy） | 整個應用程式記憶體與存檔資料庫 | — | 正式上線建議用機構可控的主機（Docker＋Caddy HTTPS）；若用公有雲須確認資料存放地區與服務條款；雲端版不開自動存檔或改存加密磁碟 |
++| **Google Fonts**（介面字型） | 使用者瀏覽器 IP | 所有業務資料 | 可改為字型檔隨程式打包，完全不連外 |
++| **LINE** | 系統不呼叫 LINE API；居督手動貼上訊息 | — | 解析後清掉原文 |
++| **門牌定位** | 不連網（政府開放資料離線索引） | — | — |
++
++- 第三方清單變更（新增 API、換主機）要先更新本表，並由機構負責人核准。
++- 使用付費／商業 API 前確認服務條款中的資料使用與保存條款；能簽資料處理約定的就簽。
++- 任何第三方失敗時，系統回退到估算值並標示，不會改送更多資料給其他服務。
++
++---
++
++## 七、異常事件處理
++
++| 嚴重度 | 例子 | 處理時限 |
++|---|---|---|
++| 高 | 存檔資料庫或匯出檔外流、帳號被盜用、遮罩姓名版大量外流 | 發現後 1 小時內通報機構負責人並止血；依主管機關規定期限通報；查明後依《個資法》通知受影響的案家與居服員 |
++| 中 | 金鑰外洩、第三方服務異常、誤把匯出檔寄給錯的人 | 24 小時內處理（換金鑰、要求刪除、確認範圍） |
++| 低 | 單次誤看、權限設定錯誤但未擴散 | 3 個工作天內修正並記錄 |
++
++處理步驟：
++
++1. **發現與回報**：任何人發現異常（含稽核警示）立即告知機構負責人與維運，不自行刪除證據。
++2. **止血**：停用相關帳號、更換 API 金鑰、暫停對外服務或關閉自動存檔。
++3. **保全證據**：保存稽核紀錄、主機日誌、可疑檔案的雜湊。
++4. **評估範圍**：用稽核紀錄找出受影響的案家ID／居服員ID、資料種類（是否含健康資料）、筆數。
++5. **通報與通知**：依主管機關規定通報；查明後以適當方式通知當事人，說明發生什麼、影響什麼、機構做了什麼、當事人可以怎麼做、聯絡窗口。
++6. **復原與檢討**：修補原因、必要時重設密碼與權限；事後 2 週內完成檢討報告，更新本文件與教育訓練。
++
++每年至少演練一次（例如模擬匯出檔誤寄）。
++
++---
++
++## 八、現況與待補對照
++
++| 已完成 | 上線前待補 |
++|---|---|
++| 姓名匯入即遮罩、只在 session | 個人帳號＋角色權限，取代單一 basic auth |
++| 運算、第三方、稽核 log 只用 ID | 完整存取稽核（登入、查看、匯出、刪除）＋防竄改 |
++| 匯出預設代碼版 | 遮罩姓名版匯出限角色 |
++| LINE 原文解析後清除 | 自動存檔加密、90 天到期刪除排程 |
++| 門牌定位離線 | 路段快取逾期實際刪除 |
++| 第三方只收座標／時間 | 第三方清單核准流程、資料處理約定 |
++| 金鑰放環境變數／secrets | 金鑰權限限縮與定期輪替 |
++| 居督覆寫紀錄 | 異常事件處理流程演練、年度檢討 |
+diff --git a/README.md b/README.md
+index dfd032a..2d75e0a 100644
+--- a/README.md
++++ b/README.md
+@@ -121,17 +121,21 @@ Excel「個案資料／歷史首選」有值時優先；主責加60分。自動
+ 
+ ## 個案照顧需求變更（資格重新檢核）
+ 
+-「03 衝突與異常處理 → 臨時異動 → 🩺 個案照顧需求變更」：照專複評後案家新增「失智」或「BA08 足部照護」，原居服員沒有對應訓練（失智症 20 小時／足部照護 10 小時）時，
+-系統列出生效日後受影響的服務，提供三種處理方式（不只換人）：
++「03 衝突與異常處理 → 臨時異動 → 🩺 個案照顧需求變更」：照專複評後案家新增「失智」或「BA08 足部照護」，原居服員沒有對應訓練（失智症 20 小時／足部照護 10 小時）時使用。
+ 
+-1. 寬限期・待受訓（預設推薦）：原居服員繼續服務到補訓期限（預設 60 天），期限後的服務改由有證照的人；
+-   失智長輩怕換人，若單位允許優先補訓。寬限期內先不要把 Excel「是否失智」改為「是」，否則重新排班時原居服員會被判定資格不符。
+-2. 交接過渡：前幾次（預設 2 次）原居服員服務、新居服員陪同，之後改由新居服員；原居服員暫留備援。
+-3. 立即改派：單位或縣市規定必須立即符合時使用。
++**法規原則**：服務只能派給具備此個案所需訓練資格的居服員；派案當下不符資格者，系統不派。
++因此不再提供「寬限期內原居服員繼續服務」，三種處理方式的服務提供者一律是有訓練的居服員，差別只在如何降低換人衝擊：
+ 
+-接手人選只列「有失智症照顧專長、且能接下（或陪同）全部受影響服務」的人，依代班挑選順序推薦第一位、可改選；
+-固定人選限制在這裡暫時開放（原居服員資格不符本來就要找人）。處理結果記入「資格追蹤」（04 也看得到）並自動存檔。
+-失智症照顧服務 20 小時訓練是失智專責服務（失智型日照、團體家屋）的人員要求；一般居家服務是否必須受訓依縣市契約、評鑑或單位內規。
++1. **立即改派（預設）**：生效日起全部受影響服務改由有訓練的居服員；一位接不完就依星期分給固定幾位（同一個星期固定同一位）。
++2. **熟面孔陪同交接**：同樣從第一次起由有訓練的居服員服務；前幾次（預設 2 次）原居服員以陪同身分到場介紹、安撫長輩，
++   不提供服務、不申報、不計服務時數（陪同的交通與工時由機構另行認定）。
++3. **補訓後回任**：同樣立即改派；另把原居服員補訓期限（預設 60 天）記入追蹤清單，完成訓練並登錄「取得資格」後，居督可評估把主責改回原居服員。
++
++三種方式都會把原居服員移出此案固定人選（不符資格不能當備援），並提醒**立即**同步 Excel（是否失智＝是／週服務計畫加 BA08），之後重新排班系統才會持續擋下沒有訓練的人。
++找不到有訓練又排得進的時段列為「缺人」，不會退回給原居服員，請與案家協調時間、回報照專或轉介。
++BA08 若不想整案換人，可讓原居服員續做原本的 BA02／BA20，BA08 另排有訓練者單獨服務（週服務計畫另加一列，走「新增服務」流程）。
++
++接手人選只列「有對應訓練、且能接下全部受影響服務」的人，依代班挑選順序推薦第一位、可改選；固定人選限制在這裡暫時開放。處理結果記入「資格追蹤」（04 也看得到）並自動存檔。
+ 
+ ## 速度（v19.5）
+ 
+@@ -142,7 +146,7 @@ Excel「個案資料／歷史首選」有值時優先；主責加60分。自動
+ 排班結果與調整前逐欄比對完全相同。
+ 
+ ### 一位接不完時
+-沒有一位有訓練的居服員能接下全部受影響服務時，系統依星期分給多位（同一個星期固定同一位，先挑能包最多星期的人）；某一次完全沒人能接時列為缺人、維持原居服員，不硬塞。所有接手的人加入固定人選團隊。
++沒有一位有訓練的居服員能接下全部受影響服務時，系統依星期分給多位（同一個星期固定同一位，先挑能包最多星期的人）；某一次完全沒人能接時列為缺人、不硬塞，也不退回給沒有訓練的原居服員。所有接手的人加入固定人選團隊。
+ 
+ ### 示範案例
+ - 新增失智：DEMO0005 陳○妹每週二、五 08:00～09:00 由 M04（沒有失智症訓練）服務，按「🎬 範例：DEMO0005 新增失智」示範（推薦有訓練的 H4681，共 4 位可選）。
+@@ -156,6 +160,10 @@ Excel「個案資料／歷史首選」有值時優先；主責加60分。自動
+ 
+ 機車維持OSRM，公車／捷運維持Google Routes。機車週型可延展，路段有持久快取；資格與日期例外、月加班仍核對。Google Transit按實際日期／時間查詢。
+ 
++## 個資與資料治理
++
++角色權限、資料最小化、保存與刪除期限、存取稽核、第三方 API 資料流與異常事件處理，見 `DATA_GOVERNANCE.md`。
++
+ ## 驗證
+ 
+ 詳見 `VALIDATION.md` 與 `排班未派診斷_v7.md`。測試使用5分鐘模擬交通，沒有驗證真實路網或金鑰。模擬草案不應直接作為實際班表。
+diff --git a/app.py b/app.py
+index d444c06..696f452 100644
+--- a/app.py
++++ b/app.py
+@@ -3380,7 +3380,7 @@ if "last_result" in st.session_state:
+                 st.session_state['qual_need'] = found['need']
+                 st.session_state['qual_client'] = client
+                 st.session_state['qual_since'] = pd.Timestamp(found['since']).date()
+-                st.session_state['qual_method'] = 'grace'
++                st.session_state['qual_method'] = 'now'
+                 st.session_state.pop('qual_avail', None)
+                 if found.get('split'):
+                     _plan = '、'.join(f"{g['星期']}→{caregiver_label(g['居服員'])}" for g in found['split']['groups'])
+@@ -3388,12 +3388,12 @@ if "last_result" in st.session_state:
+                     return (f"示範：{client_label(client)} 一直由 {caregiver_label(found['worker'])} 服務（本期 {len(found['tasks'])} 次），"
+                             f"照專複評後新增{'失智' if found['need'] == 'dementia' else ' BA08 足部照護'}，原居服員沒有訓練。"
+                             f"有訓練的居服員裡沒有一位能接下全部 {len(found['tasks'])} 次（時段撞到其他案家或工時），"
+-                            f"所以系統依星期分給 {found['options']} 位：{_plan}。下方已選「立即改派」，可以改選寬限期或交接比較。")
++                            f"所以系統依星期分給 {found['options']} 位：{_plan}。下方已選「立即改派」（法規只能派給有訓練的人）。")
+                 _story = ('照專複評後確認失智，但 {w} 沒有失智症照顧服務 20 小時訓練' if kind == 'dementia' else
+                           '照專複評後核定新增 BA08 足部照護（例如糖尿病足、趾甲增厚），但 {w} 沒有足部照護訓練')
+                 return (f"示範：{client_label(client)} 一直由 {caregiver_label(found['worker'])} 服務（本期 {len(found['tasks'])} 筆），"
+                         + _story.format(w=caregiver_label(found['worker'])) + "。下方已帶入需求、案家與生效日，"
+-                        f"可以切換三種處理方式比較：寬限期（原居服員繼續、追蹤補訓）、交接過渡、立即改派。"
++                        f"法規只能派給有訓練的人，預設「立即改派」；也可加上原居服員陪同交接，或追蹤原居服員補訓後回任。"
+                         f"有訓練又能接下全部服務的有 {found['options']} 位，推薦 {caregiver_label(found['top'])}"
+                         f"（{_label_ids_plain(found['reason'])}）。")
+             if kind in ('new1', 'new2'):
+@@ -4298,7 +4298,9 @@ if "last_result" in st.session_state:
+             import qualification_recheck as _qr
+             subhead('🩺 個案照顧需求變更：重新檢核目前的居服員資格')
+             st.caption('照專複評後，案家新增「失智」或新增「BA08 足部照護」等需要特殊訓練的照顧需求，'
+-                       '而原本服務的居服員沒有這項訓練時使用。系統會找出受影響的服務，並提供三種處理方式，不只有換人一條路。')
++                       '而原本服務的居服員沒有這項訓練時使用。系統會找出受影響的服務，全部改派給有訓練的居服員，'
++                       '並提供降低換人衝擊的作法（熟面孔陪同交接、原居服員補訓後回任）。')
++            st.info('⚖️ ' + _qr.RULE_TEXT)
+             # 需求與處理方式用大按鈕切換；範例按鈕會改 qual_need／qual_method，這裡同步到按鈕狀態。
+             _q_need_labels = {'dementia': '🧠 新增失智', 'foot': '🦶 新增足部照護（BA08）'}
+             _q_need_keys = {v: k for k, v in _q_need_labels.items()}
+@@ -4310,11 +4312,10 @@ if "last_result" in st.session_state:
+             st.session_state['qual_need'] = st.session_state['_qual_need_seen'] = _q_need
+             _q_info = _qr.NEEDS[_q_need]
+             if _q_need == 'dementia':
+-                st.caption('📌 失智症照顧服務 20 小時訓練主要是失智專責服務（失智型日照、團體家屋）的人員要求；'
+-                           '一般居家服務是否必須受訓，依縣市契約、評鑑要求或單位內規。')
++                st.caption('📌 個案確認失智後，服務須由完成失智症照顧服務 20 小時訓練並登錄的居服員提供。')
+             else:
+-                st.caption('📌 BA08 足部照護須由完成足部照護訓練（10 小時）並登錄的居服員提供。也可以原居服員繼續原本的服務、'
+-                           '另排一位有訓練的人單獨做足部照護（週服務計畫另加一列）。')
++                st.caption('📌 BA08 足部照護須由完成足部照護訓練（10 小時）並登錄的居服員提供。若不想整案換人，也可以原居服員繼續原本的服務、'
++                           '另排一位有訓練的人單獨做 BA08（週服務計畫另加一列，用「新增服務」流程）。')
+             _q_tasks, _q_effective = _workflow_frames()
+             _q_current = {str(t): (None if str(c) in _qr.EMPTY else str(c))
+                           for t, c in zip(_q_effective.get('任務ID', []), _q_effective.get('派單居服員', []))}
+@@ -4355,7 +4356,7 @@ if "last_result" in st.session_state:
+                         "<div class='cf-guide-card cf-guide-warn'><div class='cf-guide-title'>⚠️ 重新檢核："
+                         f"{client_label(_q_client)} 有 {len(_q_aff)} 次服務需要{_q_info['course']}</div>"
+                         f"<div class='cf-guide-body'>目前由 {'、'.join(caregiver_label(o) for o in _q_owners)} 服務（{_q_days_text}），"
+-                        "沒有這項訓練。請選擇處理方式，不一定要換人。</div></div>", unsafe_allow_html=True)
++                        "沒有這項訓練，依法規不能再服務這些時段，需改由有訓練的居服員。</div></div>", unsafe_allow_html=True)
+                     _qm1, _qm2, _qm3 = st.columns(3)
+                     _qm1.metric('受影響服務', f'{len(_q_aff)} 次', help='從生效日起，由沒有這項訓練的人服務的次數')
+                     _qm2.metric('原居服員', caregiver_label(_q_owner).split('｜')[0])
+@@ -4366,9 +4367,9 @@ if "last_result" in st.session_state:
+                                                  for a in _q_aff]), hide_index=True, width='stretch')
+ 
+                     st.markdown('##### ③ 選擇處理方式')
+-                    _q_method_labels = {'grace': '① 寬限期・待受訓', 'handover': '② 交接過渡', 'now': '③ 立即改派'}
++                    _q_method_labels = {'now': '① 立即改派', 'handover': '② 熟面孔陪同交接', 'grace': '③ 補訓後回任'}
+                     _q_method_keys = {v: k for k, v in _q_method_labels.items()}
+-                    _q_mwant = st.session_state.get('qual_method') if st.session_state.get('qual_method') in _q_method_labels else 'grace'
++                    _q_mwant = st.session_state.get('qual_method') if st.session_state.get('qual_method') in _q_method_labels else _qr.DEFAULT_METHOD
+                     if st.session_state.get('_qual_method_seen') != _q_mwant:
+                         st.session_state['qual_method_tab'] = _q_method_labels[_q_mwant]
+                     _q_method = _q_method_keys[big_tabs(list(_q_method_labels.values()), 'qual_method_tab', size='medium')]
+@@ -4378,11 +4379,11 @@ if "last_result" in st.session_state:
+                                 + _qr.method_help(_q_method, _q_need) + "</div></div>", unsafe_allow_html=True)
+                     _q_deadline, _q_n = None, _qr.HANDOVER_VISITS
+                     if _q_method == 'grace':
+-                        _q_deadline = st.date_input('補訓期限（預設生效日後 60 天）', value=_qr.default_deadline(_q_since),
++                        _q_deadline = st.date_input('原居服員補訓期限（預設生效日後 60 天）', value=_qr.default_deadline(_q_since),
+                                                     key=f'qual_deadline_{_q_client}')
+                     elif _q_method == 'handover':
+-                        _q_n = int(st.number_input('交接次數（原居服員服務、新居服員陪同）', 1, max(1, len(_q_aff) - 1) if len(_q_aff) > 1 else 1,
+-                                                   min(_qr.HANDOVER_VISITS, max(1, len(_q_aff) - 1)), key='qual_handover_n'))
++                        _q_n = int(st.number_input('陪同交接次數（新居服員服務、原居服員陪同）', 1, max(1, len(_q_aff)),
++                                                   min(_qr.HANDOVER_VISITS, max(1, len(_q_aff))), key='qual_handover_n'))
+                     _q_parts = _qr.split(_q_method, _q_aff, _q_deadline, _q_n)
+                     _q_cover = _qr.covering(_q_avail, _q_parts['move'], _q_parts['accompany'])
+                     _q_need_new = bool(_q_parts['move'] or _q_parts['accompany'])
+@@ -4395,8 +4396,8 @@ if "last_result" in st.session_state:
+                             _q_split = _qr.split_cover(_q_avail, _q_parts['move'], _q_parts['accompany'], _q_dayof)
+                             _q_assign = dict(_q_split['assign'])
+                             if not _q_assign:
+-                                st.error('有訓練的居服員在這些時段都排不進。可以改選「寬限期」讓原居服員先補訓，'
+-                                         '或到「未派案家」用整案處理調整時間。')
++                                st.error('有訓練的居服員在這些時段都排不進。依法規不能讓原居服員繼續服務；請到「未派案家」用整案處理'
++                                         '與案家協調調整時間，或回報照專／轉介其他單位。')
+                             else:
+                                 _q_people = sorted(set(_q_assign.values()), key=lambda w: -list(_q_assign.values()).count(w))
+                                 st.warning(f"沒有一位有訓練的居服員能接下全部 {len(_q_parts['move']) + len(_q_parts['accompany'])} 次服務，"
+@@ -4405,7 +4406,8 @@ if "last_result" in st.session_state:
+                                                           '挑選理由': _label_ids_plain(g['理由'])} for g in _q_split['groups']]),
+                                            hide_index=True, width='stretch')
+                                 if _q_split['missing']:
+-                                    st.error(f"還有 {len(_q_split['missing'])} 次找不到有訓練又排得進的人，套用後仍由原居服員服務，請另外處理（例如調整時間）。")
++                                    st.error(f"還有 {len(_q_split['missing'])} 次找不到有訓練又排得進的人。套用後這幾次會列在失敗清單，"
++                                                     "原居服員不符資格不能服務，請調整時間、回報照專或轉介。")
+                         else:
+                             _q_ids = [c['cg'] for c in _q_cover]
+                             _q_why = {c['cg']: c['reason'] for c in _q_cover}
+@@ -4419,19 +4421,19 @@ if "last_result" in st.session_state:
+                     for a in _q_aff:
+                         t = a['任務ID']
+                         _who = _q_assign.get(t)
+-                        if t in _q_parts['move']:
+-                            how = f"改由 {caregiver_label(_who)} 服務" if _who else '找不到人，暫由原居服員服務（需另外處理）'
+-                        elif t in _q_parts['accompany']:
+-                            how = f"{caregiver_label(a['居服員'])} 服務，{caregiver_label(_who) if _who else '（找不到陪同的人）'} 陪同交接"
++                        if not _who:
++                            how = '⚠️ 缺人：找不到有訓練又排得進的人（原居服員不符資格，不可服務）'
++                        elif t in _q_parts.get('escort', []):
++                            how = f"改由 {caregiver_label(_who)} 服務，{caregiver_label(a['居服員'])} 陪同交接（不提供服務）"
+                         else:
+-                            how = f"{caregiver_label(a['居服員'])} 繼續服務（待受訓，寬限期內）"
++                            how = f"改由 {caregiver_label(_who)} 服務"
+                         _q_preview.append({'服務': _q_label[t], '處理後': how})
+                     st.markdown('##### ④ 套用後的樣子')
+                     show_table(pd.DataFrame(_q_preview), hide_index=True, width='stretch')
+-                    if _q_method == 'grace' and not _q_parts['move']:
+-                        st.caption('本次排班期間的服務都在寬限期內，班表不變；系統會把補訓期限記入追蹤清單（04 也看得到）。')
+-                    if _q_parts['accompany'] and _q_assign:
+-                        st.caption('陪同交接不另計一筆服務，只檢查新居服員那個時段有空並記入追蹤清單；請另外通知兩位居服員。')
++                    if _q_method == 'grace':
++                        st.caption('原居服員的補訓期限會記入追蹤清單（04 也看得到）；取得資格並登錄後，可到固定人選評估改回主責。')
++                    if _q_parts.get('escort') and _q_assign:
++                        st.caption('陪同交接不另計一筆服務、不申報；原居服員本來就排在這些時段，請另外通知兩位居服員與家屬。')
+                     _q_blocked = _q_need_new and not _q_assign
+                     if st.button('✅ 套用處理方式', type='primary', key='qual_apply', disabled=_q_blocked):
+                         _q_now = pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')
+@@ -4458,8 +4460,8 @@ if "last_result" in st.session_state:
+                         st.session_state['dynamic_adjustment_log'].append({
+                             '時間戳記': _q_now, '事件類型': '個案' + _q_info['label'], '案家ID': _q_client, '日期': str(_q_since),
+                             '處理方式': _qr.METHOD_SHORT[_q_method], '原居服員': _q_owner, '最終選擇居服員': '、'.join(_q_takers),
+-                            '改派筆數': len(_q_parts['move']) - len(_q_fail), '陪同交接筆數': len(_q_parts['accompany']),
+-                            '原居服員續服務筆數': len(_q_parts['keep']), '原因': _q_reason})
++                            '改派筆數': len(_q_parts['move']) - len(_q_fail), '原居服員陪同筆數': len(_q_parts.get('escort', [])),
++                            '缺人筆數': len(_q_fail), '原因': _q_reason})
+                         _follow = _qr.followup(_q_method, client_label(_q_client), caregiver_label(_q_owner),
+                                                '、'.join(caregiver_label(w) for w in _q_takers), _q_parts, _q_deadline, _q_now, need=_q_need)
+                         st.session_state.setdefault('qualification_followups', []).append(_follow)
+@@ -4472,7 +4474,7 @@ if "last_result" in st.session_state:
+             if st.session_state.get('qual_notice'):
+                 st.success(st.session_state.pop('qual_notice'))
+             if st.session_state.get('qualification_followups'):
+-                st.markdown('**資格追蹤清單**（待受訓期限、交接進度）')
++                st.markdown('**資格追蹤清單**（補訓期限、陪同交接進度）')
+                 show_table(pd.DataFrame(st.session_state['qualification_followups']), hide_index=True, width='stretch')
+ 
+         if st.session_state.get("dynamic_adjustment_log"):
+@@ -4830,7 +4832,7 @@ if "last_result" in st.session_state:
+             _follow_rows = st.session_state.get('qualification_followups') or []
+             if _follow_rows:
+                 show_table(pd.DataFrame(_follow_rows), width='stretch', hide_index=True)
+-                st.caption('寬限期到期前請確認原居服員已完成訓練並更新員工資料「取得資格」；未完成者請到「03 → 臨時異動 → 🩺 個案照顧需求變更」改選交接或立即改派。')
++                st.caption('補訓期限到期前請確認原居服員已完成訓練並更新員工資料「取得資格」；取得資格後才可改回主責，未完成者維持由有訓練的居服員服務。')
+             else:
+                 st.info('目前沒有資格追蹤項目（案家新增失智、足部照護等資格重新檢核會記在這裡）。')
+         module_nav_buttons(M_REVIEW)
+diff --git a/qualification_recheck.py b/qualification_recheck.py
+index 0b33251..7593303 100644
+--- a/qualification_recheck.py
++++ b/qualification_recheck.py
+@@ -1,11 +1,18 @@
+ """個案照顧需求變更的資格重新檢核：案家新增「失智」或新增「BA08 足部照護」。
+ 
+ 原本由 A 長期服務的案家，照專複評後新增需求（確認失智，或核定 BA08 足部照護），
+-A 沒有對應訓練（失智症 20 小時／足部照護 10 小時）時，不只一條路，居督可選三種處理方式：
+-  grace    寬限期（待受訓）：A 繼續服務到期限，期限後的服務改由 B；追蹤 A 補訓。
+-  handover 交接過渡：前幾次仍由 A 服務、B 陪同認識案家，之後改由 B 服務。
+-  now      立即改派：所有受影響服務改由 B。
+-長期服務的案家（尤其失智）怕換人，所以預設推薦「寬限期」；單位或縣市規定必須立即符合時才選「立即改派」。
++A 沒有對應訓練（失智症 20 小時／足部照護 10 小時）時：
++
++法規原則（v20 起）：服務只能派給「具備該案所需訓練資格」的居服員；派案當下不符資格的人，
++系統不派、不留「寬限期內繼續服務」。因此三種處理方式的「服務提供者」一律是有訓練的居服員，
++差別只在怎麼降低換人衝擊、以及原居服員之後能不能回來：
++  now      立即改派（預設）：生效日起全部改由有訓練的居服員；一位接不完就依星期分給固定幾位。
++  handover 熟面孔陪同交接：同樣從第一次起由有訓練的居服員服務；前幾次原居服員以「陪同」身分到場
++           介紹、協助長輩認識新面孔（不是服務提供者、不申報服務、不計服務時數；需機構同意）。
++  grace    補訓後回任：同樣立即改派；另追蹤原居服員在期限內完成補訓，取得資格並登錄後，
++           居督可評估把主責改回原居服員（恢復照顧連續性）。補訓期間原居服員不得服務此案。
++BA08 另有一種常見作法：原居服員繼續原本的 BA02／BA20 等服務，BA08 另排一位有訓練者單獨服務
++（週服務計畫另加一列），這屬於「新增服務」流程，不在本模組。
+ 
+ 這裡只放純計算（可單獨測試）；畫面與寫入班表在 app.py。
+ """
+@@ -17,37 +24,42 @@ import pandas as pd
+ import caregiver_engine as engine
+ 
+ CERT = '失智症照顧專長'
+-# 需求種類：(畫面名稱, 需要的資格, 補訓課程, 寬限期說明)
++# 需求種類：(畫面名稱, 需要的資格, 補訓課程, 降低換人衝擊的說明)
+ NEEDS = {
+     'dementia': {'label': '新增失智', 'cert': '失智症照顧專長', 'course': '失智症照顧服務 20 小時訓練',
+-                 'why': '失智長輩對熟悉的照顧者比較穩定，換生面孔容易拒絕服務或出現情緒行為。',
++                 'why': '失智長輩對熟悉的照顧者比較穩定，換生面孔容易拒絕服務或出現情緒行為，交接時可請原居服員陪同。',
+                  'excel': '把機構 Excel「個案資料」的是否失智改為「是」'},
+     'foot': {'label': '新增足部照護（BA08）', 'cert': 'BA08足部照護', 'course': 'BA08 足部照護 10 小時訓練',
+-             'why': '長期服務的居服員熟悉長輩與家屬，補訓後由同一人做足部照護最順。',
++             'why': '長期服務的居服員熟悉長輩與家屬；也可以原居服員續做原本服務、BA08 另排有訓練的人單獨服務。',
+              'excel': '在機構 Excel「週服務計畫」這個案家的服務項目加上 BA08'},
+ }
+-METHODS = ('grace', 'handover', 'now')
+-METHOD_SHORT = {'grace': '寬限期・待受訓', 'handover': '交接過渡', 'now': '立即改派'}
++METHODS = ('now', 'handover', 'grace')
++DEFAULT_METHOD = 'now'
++RULE_TEXT = '法規規定：只能派給具備此個案所需訓練資格的居服員；派案當下不符資格者，系統不會派給他。'
++METHOD_SHORT = {'now': '立即改派', 'handover': '熟面孔陪同交接', 'grace': '補訓後回任'}
+ 
+ 
+ def method_label(method, need='dementia'):
+     course = NEEDS[need]['course']
+-    return {'grace': f'① 寬限期・待受訓（原居服員繼續服務，期限內完成{course}）',
+-            'handover': '② 交接過渡（前幾次由原居服員服務、新居服員陪同，之後改由新居服員）',
+-            'now': '③ 立即改派（單位或縣市規定必須立即符合時）'}[method]
++    return {'now': '① 立即改派（法規規定，預設：生效日起全部由有訓練的居服員服務）',
++            'handover': '② 熟面孔陪同交接（有訓練的居服員服務，前幾次原居服員陪同、不提供服務）',
++            'grace': f'③ 補訓後回任（立即改派，原居服員期限內完成{course}後可評估改回主責）'}[method]
+ 
+ 
+ def method_help(method, need='dementia'):
+     info = NEEDS[need]
+-    return {'grace': info['why'] + '若單位允許，優先讓原居服員補訓。期限後仍未取得資格的服務，會先排給有訓練的居服員。',
+-            'handover': '原居服員確定不補訓、或案家狀況需要更有經驗的人時使用。前幾次讓新居服員陪同熟悉長輩與家屬，降低換人衝擊。',
+-            'now': '單位內規或縣市契約要求必須由受訓人員服務、且沒有寬限時使用。'}[method]
++    return {'now': '單位與縣市都要求服務人員須具備資格，生效日起不符資格的人不能再服務此案。'
++                   '一位接不完時，依星期分給固定幾位，讓長輩每週同一天看到同一個人。',
++            'handover': info['why'] + '陪同不另計一筆服務、不申報，原居服員只做介紹與情緒安撫，'
++                        '照顧服務（含失智照顧、足部照護）由有訓練的居服員執行；陪同的交通與工時請機構另行認定。',
++            'grace': '服務仍立即改由有訓練的人；另把原居服員的補訓期限記入追蹤清單。完成訓練並在員工資料登錄「取得資格」後，'
++                     '可到固定人選把主責改回原居服員。補訓期間原居服員不得服務此案，也不列為此案備援。'}[method]
+ 
+ 
+ # 舊版相容（只有失智時的文字）
+ METHOD_LABEL = {m: method_label(m) for m in METHODS}
+ METHOD_HELP = {m: method_help(m) for m in METHODS}
+-GRACE_DAYS = 60
++GRACE_DAYS = 60          # 原居服員補訓期限預設天數（補訓後回任用；不是可繼續服務的寬限期）
+ HANDOVER_VISITS = 2
+ EMPTY = ('', '未指派', 'None', 'nan', 'NaT')
+ 
+@@ -91,16 +103,13 @@ def affected_tasks(client, tasks, current_map, df_cg, since=None, need='dementia
+ 
+ 
+ def split(method, affected, deadline=None, handover=HANDOVER_VISITS):
+-    """依處理方式把受影響服務分成：keep（原居服員繼續）、accompany（新居服員陪同）、move（改由新居服員）。"""
++    """依處理方式把受影響服務分成：
++    move（改由有訓練的居服員服務）：三種方式都是全部，法規不允許不符資格者繼續服務；
++    escort（原居服員陪同、不提供服務）：只有熟面孔陪同交接的前 handover 次；
++    keep／accompany：舊版欄位，固定為空（保留給舊程式與存檔相容）。"""
+     ids = [a['任務ID'] for a in affected]
+-    if method == 'grace':
+-        limit = _day(deadline) or '9999-12-31'
+-        keep = [a['任務ID'] for a in affected if a['日期'] <= limit]
+-        return {'keep': keep, 'accompany': [], 'move': [t for t in ids if t not in keep]}
+-    if method == 'handover':
+-        n = max(0, int(handover))
+-        return {'keep': ids[:n], 'accompany': ids[:n], 'move': ids[n:]}
+-    return {'keep': [], 'accompany': [], 'move': ids}
++    escort = ids[:max(0, int(handover))] if method == 'handover' else []
++    return {'keep': [], 'accompany': [], 'escort': escort, 'move': ids}
+ 
+ 
+ def availability(task_ids, candidate_ids, tasks, effective, df_cg, config, df_cl=None, task_locations=None):
+@@ -136,13 +145,9 @@ def covering(avail, need_ids, accompany_ids=()):
+ 
+ 
+ def team_after(method, owner, backups, newcomer):
+-    """處理後的固定人選（主責, 備援）。寬限期：原居服員仍主責，新居服員加入備援；
+-    交接：新居服員主責，原居服員暫留備援到交接結束；立即改派：新居服員主責，原居服員移出。"""
++    """處理後的固定人選（主責, 備援）。三種方式都由有訓練的新居服員主責，原居服員移出此案團隊
++    （不符資格不能當備援）；補訓後回任要等原居服員取得資格，再由居督手動改回。"""
+     backups = [b for b in (backups or []) if b and b not in (owner, newcomer)]
+-    if method == 'grace':
+-        return owner, [newcomer, *backups][:2]
+-    if method == 'handover':
+-        return newcomer, [owner, *backups][:2]
+     return newcomer, backups[:2]
+ 
+ 
+@@ -156,16 +161,16 @@ def followup(method, client, owner, newcomer, parts, deadline=None, created='',
+     """追蹤清單的一筆（04 與臨時異動頁顯示，自動存檔一起保存）。"""
+     info = NEEDS[need]
+     if method == 'grace':
+-        todo = f'{owner} 需在 {_day(deadline)} 前完成{info["course"]}，完成後請更新員工資料「取得資格」'
++        todo = (f'已改由 {newcomer} 服務；{owner} 需在 {_day(deadline)} 前完成{info["course"]}，'
++                '完成後更新員工資料「取得資格」，再評估是否改回主責')
+     elif method == 'handover':
+-        todo = f'前 {len(parts["accompany"])} 次由 {newcomer} 陪同交接，之後由 {newcomer} 服務'
++        todo = f'已改由 {newcomer} 服務；前 {len(parts.get("escort", []))} 次請 {owner} 陪同交接（不提供服務、不申報）'
+     else:
+         todo = f'已全部改由 {newcomer} 服務'
+     return {'案家': client, '需求變更': info['label'], '原居服員': owner, '接手居服員': newcomer, '處理方式': METHOD_SHORT[method],
+-            '期限': _day(deadline) if method == 'grace' else '', '原居服員續服務': len(parts['keep']),
+-            '新居服員陪同': len(parts['accompany']), '改由新居服員': len(parts['move']),
+-            '待辦': todo, '提醒': '請同步' + info['excel'] + (
+-                '（寬限期內先不要改，否則重新排班時原居服員會被判定資格不符）' if method == 'grace' else ''),
++            '期限': _day(deadline) if method == 'grace' else '', '改由有訓練者服務': len(parts['move']),
++            '原居服員陪同': len(parts.get('escort', [])), '待辦': todo,
++            '提醒': '請立即同步' + info['excel'] + '，之後重新排班時系統才會持續擋下沒有訓練的人',
+             '建立時間': created, '狀態': '追蹤中'}
+ 
+ 
+diff --git a/tests/test_qualification_recheck.py b/tests/test_qualification_recheck.py
+index 5349e1f..a74d500 100644
+--- a/tests/test_qualification_recheck.py
++++ b/tests/test_qualification_recheck.py
+@@ -21,11 +21,15 @@ def test_affected_only_uncertified_from_effective_date():
+     assert [a['任務ID'] for a in out] == ['t2', 't4']      # t1 早於生效日、t3 已是有證照的 B、x1 是別的案家
+ 
+ 
+-def test_split_by_method():
++def test_split_never_keeps_uncertified_worker():
++    # 法規：只能派給有訓練的人，三種方式都把全部受影響服務改派，沒有「寬限期內繼續服務」
+     aff = [{'任務ID': t, '日期': d} for t, d in [('t1', '2026-11-02'), ('t2', '2026-11-09'), ('t3', '2026-12-07')]]
+-    assert qr.split('grace', aff, '2026-11-30') == {'keep': ['t1', 't2'], 'accompany': [], 'move': ['t3']}
+-    assert qr.split('handover', aff, handover=1) == {'keep': ['t1'], 'accompany': ['t1'], 'move': ['t2', 't3']}
+-    assert qr.split('now', aff)['move'] == ['t1', 't2', 't3']
++    for method in qr.METHODS:
++        parts = qr.split(method, aff, '2026-11-30', handover=1)
++        assert parts['move'] == ['t1', 't2', 't3'] and parts['keep'] == [] and parts['accompany'] == []
++    assert qr.split('handover', aff, handover=2)['escort'] == ['t1', 't2']    # 原居服員陪同、不提供服務
++    assert qr.split('grace', aff, '2026-11-30')['escort'] == []
++    assert qr.DEFAULT_METHOD == 'now' and qr.METHODS[0] == 'now'
+ 
+ 
+ def test_covering_needs_every_task_and_ranks_by_average_position():
+@@ -35,10 +39,9 @@ def test_covering_needs_every_task_and_ranks_by_average_position():
+     assert qr.covering(avail, []) == []
+ 
+ 
+-def test_team_after_each_method():
+-    assert qr.team_after('grace', 'A', ['D'], 'B') == ('A', ['B', 'D'])
+-    assert qr.team_after('handover', 'A', ['D'], 'B') == ('B', ['A', 'D'])
+-    assert qr.team_after('now', 'A', ['D', 'B'], 'B') == ('B', ['D'])
++def test_team_after_removes_uncertified_owner():
++    for method in qr.METHODS:
++        assert qr.team_after(method, 'A', ['D', 'B'], 'B') == ('B', ['D'])
+ 
+ 
+ def test_foot_care_need_uses_ba08_training():
+@@ -48,6 +51,9 @@ def test_foot_care_need_uses_ba08_training():
+     assert [a['任務ID'] for a in out] == ['t1']
+     row = qr.followup('grace', 'C1', 'A', 'F', qr.split('grace', out, '2026-12-31'), '2026-12-31', need='foot')
+     assert '足部照護 10 小時' in row['待辦'] and 'BA08' in row['提醒'] and row['需求變更'].startswith('新增足部照護')
++    assert '已改由 F 服務' in row['待辦'] and row['改由有訓練者服務'] == 1
++    row = qr.followup('handover', 'C1', 'A', 'F', qr.split('handover', out, handover=1), need='foot')
++    assert row['原居服員陪同'] == 1 and '不提供服務' in row['待辦']
+ 
+ 
+ def test_split_cover_by_weekday_when_nobody_takes_all():
+-- 
+2.43.0
+

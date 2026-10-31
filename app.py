@@ -3380,7 +3380,7 @@ if "last_result" in st.session_state:
                 st.session_state['qual_need'] = found['need']
                 st.session_state['qual_client'] = client
                 st.session_state['qual_since'] = pd.Timestamp(found['since']).date()
-                st.session_state['qual_method'] = 'grace'
+                st.session_state['qual_method'] = 'now'
                 st.session_state.pop('qual_avail', None)
                 if found.get('split'):
                     _plan = '、'.join(f"{g['星期']}→{caregiver_label(g['居服員'])}" for g in found['split']['groups'])
@@ -3388,12 +3388,12 @@ if "last_result" in st.session_state:
                     return (f"示範：{client_label(client)} 一直由 {caregiver_label(found['worker'])} 服務（本期 {len(found['tasks'])} 次），"
                             f"照專複評後新增{'失智' if found['need'] == 'dementia' else ' BA08 足部照護'}，原居服員沒有訓練。"
                             f"有訓練的居服員裡沒有一位能接下全部 {len(found['tasks'])} 次（時段撞到其他案家或工時），"
-                            f"所以系統依星期分給 {found['options']} 位：{_plan}。下方已選「立即改派」，可以改選寬限期或交接比較。")
+                            f"所以系統依星期分給 {found['options']} 位：{_plan}。下方已選「立即改派」（法規只能派給有訓練的人）。")
                 _story = ('照專複評後確認失智，但 {w} 沒有失智症照顧服務 20 小時訓練' if kind == 'dementia' else
                           '照專複評後核定新增 BA08 足部照護（例如糖尿病足、趾甲增厚），但 {w} 沒有足部照護訓練')
                 return (f"示範：{client_label(client)} 一直由 {caregiver_label(found['worker'])} 服務（本期 {len(found['tasks'])} 筆），"
                         + _story.format(w=caregiver_label(found['worker'])) + "。下方已帶入需求、案家與生效日，"
-                        f"可以切換三種處理方式比較：寬限期（原居服員繼續、追蹤補訓）、交接過渡、立即改派。"
+                        f"法規只能派給有訓練的人，預設「立即改派」；也可加上原居服員陪同交接，或追蹤原居服員補訓後回任。"
                         f"有訓練又能接下全部服務的有 {found['options']} 位，推薦 {caregiver_label(found['top'])}"
                         f"（{_label_ids_plain(found['reason'])}）。")
             if kind in ('new1', 'new2'):
@@ -4298,7 +4298,9 @@ if "last_result" in st.session_state:
             import qualification_recheck as _qr
             subhead('🩺 個案照顧需求變更：重新檢核目前的居服員資格')
             st.caption('照專複評後，案家新增「失智」或新增「BA08 足部照護」等需要特殊訓練的照顧需求，'
-                       '而原本服務的居服員沒有這項訓練時使用。系統會找出受影響的服務，並提供三種處理方式，不只有換人一條路。')
+                       '而原本服務的居服員沒有這項訓練時使用。系統會找出受影響的服務，全部改派給有訓練的居服員，'
+                       '並提供降低換人衝擊的作法（熟面孔陪同交接、原居服員補訓後回任）。')
+            st.info('⚖️ ' + _qr.RULE_TEXT)
             # 需求與處理方式用大按鈕切換；範例按鈕會改 qual_need／qual_method，這裡同步到按鈕狀態。
             _q_need_labels = {'dementia': '🧠 新增失智', 'foot': '🦶 新增足部照護（BA08）'}
             _q_need_keys = {v: k for k, v in _q_need_labels.items()}
@@ -4310,11 +4312,10 @@ if "last_result" in st.session_state:
             st.session_state['qual_need'] = st.session_state['_qual_need_seen'] = _q_need
             _q_info = _qr.NEEDS[_q_need]
             if _q_need == 'dementia':
-                st.caption('📌 失智症照顧服務 20 小時訓練主要是失智專責服務（失智型日照、團體家屋）的人員要求；'
-                           '一般居家服務是否必須受訓，依縣市契約、評鑑要求或單位內規。')
+                st.caption('📌 個案確認失智後，服務須由完成失智症照顧服務 20 小時訓練並登錄的居服員提供。')
             else:
-                st.caption('📌 BA08 足部照護須由完成足部照護訓練（10 小時）並登錄的居服員提供。也可以原居服員繼續原本的服務、'
-                           '另排一位有訓練的人單獨做足部照護（週服務計畫另加一列）。')
+                st.caption('📌 BA08 足部照護須由完成足部照護訓練（10 小時）並登錄的居服員提供。若不想整案換人，也可以原居服員繼續原本的服務、'
+                           '另排一位有訓練的人單獨做 BA08（週服務計畫另加一列，用「新增服務」流程）。')
             _q_tasks, _q_effective = _workflow_frames()
             _q_current = {str(t): (None if str(c) in _qr.EMPTY else str(c))
                           for t, c in zip(_q_effective.get('任務ID', []), _q_effective.get('派單居服員', []))}
@@ -4355,7 +4356,7 @@ if "last_result" in st.session_state:
                         "<div class='cf-guide-card cf-guide-warn'><div class='cf-guide-title'>⚠️ 重新檢核："
                         f"{client_label(_q_client)} 有 {len(_q_aff)} 次服務需要{_q_info['course']}</div>"
                         f"<div class='cf-guide-body'>目前由 {'、'.join(caregiver_label(o) for o in _q_owners)} 服務（{_q_days_text}），"
-                        "沒有這項訓練。請選擇處理方式，不一定要換人。</div></div>", unsafe_allow_html=True)
+                        "沒有這項訓練，依法規不能再服務這些時段，需改由有訓練的居服員。</div></div>", unsafe_allow_html=True)
                     _qm1, _qm2, _qm3 = st.columns(3)
                     _qm1.metric('受影響服務', f'{len(_q_aff)} 次', help='從生效日起，由沒有這項訓練的人服務的次數')
                     _qm2.metric('原居服員', caregiver_label(_q_owner).split('｜')[0])
@@ -4366,9 +4367,9 @@ if "last_result" in st.session_state:
                                                  for a in _q_aff]), hide_index=True, width='stretch')
 
                     st.markdown('##### ③ 選擇處理方式')
-                    _q_method_labels = {'grace': '① 寬限期・待受訓', 'handover': '② 交接過渡', 'now': '③ 立即改派'}
+                    _q_method_labels = {'now': '① 立即改派', 'handover': '② 熟面孔陪同交接', 'grace': '③ 補訓後回任'}
                     _q_method_keys = {v: k for k, v in _q_method_labels.items()}
-                    _q_mwant = st.session_state.get('qual_method') if st.session_state.get('qual_method') in _q_method_labels else 'grace'
+                    _q_mwant = st.session_state.get('qual_method') if st.session_state.get('qual_method') in _q_method_labels else _qr.DEFAULT_METHOD
                     if st.session_state.get('_qual_method_seen') != _q_mwant:
                         st.session_state['qual_method_tab'] = _q_method_labels[_q_mwant]
                     _q_method = _q_method_keys[big_tabs(list(_q_method_labels.values()), 'qual_method_tab', size='medium')]
@@ -4378,11 +4379,11 @@ if "last_result" in st.session_state:
                                 + _qr.method_help(_q_method, _q_need) + "</div></div>", unsafe_allow_html=True)
                     _q_deadline, _q_n = None, _qr.HANDOVER_VISITS
                     if _q_method == 'grace':
-                        _q_deadline = st.date_input('補訓期限（預設生效日後 60 天）', value=_qr.default_deadline(_q_since),
+                        _q_deadline = st.date_input('原居服員補訓期限（預設生效日後 60 天）', value=_qr.default_deadline(_q_since),
                                                     key=f'qual_deadline_{_q_client}')
                     elif _q_method == 'handover':
-                        _q_n = int(st.number_input('交接次數（原居服員服務、新居服員陪同）', 1, max(1, len(_q_aff) - 1) if len(_q_aff) > 1 else 1,
-                                                   min(_qr.HANDOVER_VISITS, max(1, len(_q_aff) - 1)), key='qual_handover_n'))
+                        _q_n = int(st.number_input('陪同交接次數（新居服員服務、原居服員陪同）', 1, max(1, len(_q_aff)),
+                                                   min(_qr.HANDOVER_VISITS, max(1, len(_q_aff))), key='qual_handover_n'))
                     _q_parts = _qr.split(_q_method, _q_aff, _q_deadline, _q_n)
                     _q_cover = _qr.covering(_q_avail, _q_parts['move'], _q_parts['accompany'])
                     _q_need_new = bool(_q_parts['move'] or _q_parts['accompany'])
@@ -4395,8 +4396,8 @@ if "last_result" in st.session_state:
                             _q_split = _qr.split_cover(_q_avail, _q_parts['move'], _q_parts['accompany'], _q_dayof)
                             _q_assign = dict(_q_split['assign'])
                             if not _q_assign:
-                                st.error('有訓練的居服員在這些時段都排不進。可以改選「寬限期」讓原居服員先補訓，'
-                                         '或到「未派案家」用整案處理調整時間。')
+                                st.error('有訓練的居服員在這些時段都排不進。依法規不能讓原居服員繼續服務；請到「未派案家」用整案處理'
+                                         '與案家協調調整時間，或回報照專／轉介其他單位。')
                             else:
                                 _q_people = sorted(set(_q_assign.values()), key=lambda w: -list(_q_assign.values()).count(w))
                                 st.warning(f"沒有一位有訓練的居服員能接下全部 {len(_q_parts['move']) + len(_q_parts['accompany'])} 次服務，"
@@ -4405,7 +4406,8 @@ if "last_result" in st.session_state:
                                                           '挑選理由': _label_ids_plain(g['理由'])} for g in _q_split['groups']]),
                                            hide_index=True, width='stretch')
                                 if _q_split['missing']:
-                                    st.error(f"還有 {len(_q_split['missing'])} 次找不到有訓練又排得進的人，套用後仍由原居服員服務，請另外處理（例如調整時間）。")
+                                    st.error(f"還有 {len(_q_split['missing'])} 次找不到有訓練又排得進的人。套用後這幾次會列在失敗清單，"
+                                                     "原居服員不符資格不能服務，請調整時間、回報照專或轉介。")
                         else:
                             _q_ids = [c['cg'] for c in _q_cover]
                             _q_why = {c['cg']: c['reason'] for c in _q_cover}
@@ -4419,19 +4421,19 @@ if "last_result" in st.session_state:
                     for a in _q_aff:
                         t = a['任務ID']
                         _who = _q_assign.get(t)
-                        if t in _q_parts['move']:
-                            how = f"改由 {caregiver_label(_who)} 服務" if _who else '找不到人，暫由原居服員服務（需另外處理）'
-                        elif t in _q_parts['accompany']:
-                            how = f"{caregiver_label(a['居服員'])} 服務，{caregiver_label(_who) if _who else '（找不到陪同的人）'} 陪同交接"
+                        if not _who:
+                            how = '⚠️ 缺人：找不到有訓練又排得進的人（原居服員不符資格，不可服務）'
+                        elif t in _q_parts.get('escort', []):
+                            how = f"改由 {caregiver_label(_who)} 服務，{caregiver_label(a['居服員'])} 陪同交接（不提供服務）"
                         else:
-                            how = f"{caregiver_label(a['居服員'])} 繼續服務（待受訓，寬限期內）"
+                            how = f"改由 {caregiver_label(_who)} 服務"
                         _q_preview.append({'服務': _q_label[t], '處理後': how})
                     st.markdown('##### ④ 套用後的樣子')
                     show_table(pd.DataFrame(_q_preview), hide_index=True, width='stretch')
-                    if _q_method == 'grace' and not _q_parts['move']:
-                        st.caption('本次排班期間的服務都在寬限期內，班表不變；系統會把補訓期限記入追蹤清單（04 也看得到）。')
-                    if _q_parts['accompany'] and _q_assign:
-                        st.caption('陪同交接不另計一筆服務，只檢查新居服員那個時段有空並記入追蹤清單；請另外通知兩位居服員。')
+                    if _q_method == 'grace':
+                        st.caption('原居服員的補訓期限會記入追蹤清單（04 也看得到）；取得資格並登錄後，可到固定人選評估改回主責。')
+                    if _q_parts.get('escort') and _q_assign:
+                        st.caption('陪同交接不另計一筆服務、不申報；原居服員本來就排在這些時段，請另外通知兩位居服員與家屬。')
                     _q_blocked = _q_need_new and not _q_assign
                     if st.button('✅ 套用處理方式', type='primary', key='qual_apply', disabled=_q_blocked):
                         _q_now = pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -4458,8 +4460,8 @@ if "last_result" in st.session_state:
                         st.session_state['dynamic_adjustment_log'].append({
                             '時間戳記': _q_now, '事件類型': '個案' + _q_info['label'], '案家ID': _q_client, '日期': str(_q_since),
                             '處理方式': _qr.METHOD_SHORT[_q_method], '原居服員': _q_owner, '最終選擇居服員': '、'.join(_q_takers),
-                            '改派筆數': len(_q_parts['move']) - len(_q_fail), '陪同交接筆數': len(_q_parts['accompany']),
-                            '原居服員續服務筆數': len(_q_parts['keep']), '原因': _q_reason})
+                            '改派筆數': len(_q_parts['move']) - len(_q_fail), '原居服員陪同筆數': len(_q_parts.get('escort', [])),
+                            '缺人筆數': len(_q_fail), '原因': _q_reason})
                         _follow = _qr.followup(_q_method, client_label(_q_client), caregiver_label(_q_owner),
                                                '、'.join(caregiver_label(w) for w in _q_takers), _q_parts, _q_deadline, _q_now, need=_q_need)
                         st.session_state.setdefault('qualification_followups', []).append(_follow)
@@ -4472,7 +4474,7 @@ if "last_result" in st.session_state:
             if st.session_state.get('qual_notice'):
                 st.success(st.session_state.pop('qual_notice'))
             if st.session_state.get('qualification_followups'):
-                st.markdown('**資格追蹤清單**（待受訓期限、交接進度）')
+                st.markdown('**資格追蹤清單**（補訓期限、陪同交接進度）')
                 show_table(pd.DataFrame(st.session_state['qualification_followups']), hide_index=True, width='stretch')
 
         if st.session_state.get("dynamic_adjustment_log"):
@@ -4830,7 +4832,7 @@ if "last_result" in st.session_state:
             _follow_rows = st.session_state.get('qualification_followups') or []
             if _follow_rows:
                 show_table(pd.DataFrame(_follow_rows), width='stretch', hide_index=True)
-                st.caption('寬限期到期前請確認原居服員已完成訓練並更新員工資料「取得資格」；未完成者請到「03 → 臨時異動 → 🩺 個案照顧需求變更」改選交接或立即改派。')
+                st.caption('補訓期限到期前請確認原居服員已完成訓練並更新員工資料「取得資格」；取得資格後才可改回主責，未完成者維持由有訓練的居服員服務。')
             else:
                 st.info('目前沒有資格追蹤項目（案家新增失智、足部照護等資格重新檢核會記在這裡）。')
         module_nav_buttons(M_REVIEW)
