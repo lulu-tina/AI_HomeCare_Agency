@@ -253,6 +253,15 @@ class PipelineConfig:
     # 只記在該次服務上，不會變成該案的固定備援，原則仍是「1 位主責＋最多 N 位備援」。
     enable_support_caregiver: bool = False
     task_support_map: dict = field(default_factory=dict, repr=False)  # 任務ID → 臨時支援居服員ID
+    # 轉場目標（monthly_scheduler）：派出數優先、主責其次，派出數相同時偏好總轉場較少的派法。
+    #   off      ＝舊行為（各步驟取第一位可行人選）。
+    #   weighted ＝各選人步驟在「派出數」之後比較新增轉場：分數＝派出數×1,000,000 − 權重×轉場分鐘。
+    #   two_stage＝先照舊排班；第二階段只搬移／交換非主責服務，派出數與主責服務不變，轉場變少才接受。
+    travel_objective_mode: str = 'two_stage'
+    travel_objective_weight: float = 1.0     # 每分鐘轉場成本（派出一筆服務固定值 1,000,000）
+    travel_home_weight: float = 0.25         # 首案從住家出發的通勤不算轉場工資，以較小權重納入
+    travel_stage2_seconds: float = 20.0      # two_stage 第二階段的時間預算；逾時保留已驗證的目前解
+    travel_stage2_min_gain_minutes: float = 5.0  # 第二階段改派門檻：付費轉場（不含住家通勤）至少少這麼多分鐘才換人
     client_primary_map: dict = field(default_factory=dict)
     primary_profiles: dict = field(default_factory=dict, repr=False)
     work_day_minutes: dict = field(default_factory=dict, repr=False)
