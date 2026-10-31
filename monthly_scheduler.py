@@ -7,6 +7,7 @@ CAREFLOW_BUILD = '2026.10.18-v19'
 from dataclasses import replace
 from collections import Counter
 import re
+import time
 import pandas as pd
 from ortools.linear_solver import pywraplp
 from agency_rules import leave_overlap, clean, finite, monthly_overtime_error, consecutive_workdays_error
@@ -263,6 +264,59 @@ def _run_expanded_dispatch(tasks,caregivers,clients,config,primary_map=None,prog
             '排班日期':day,'固定居服員ID':owners[str(task['案家ID'])],'是否請假代班':bool(absence),
             '代班排序理由':rank_reason})
 
+    # ---- 轉場成本：同一居服員同一天依開始時間排序後「實際相鄰」的不同案家才計（含工作緩衝），
+    # 與 calculate_schedule_travel／payroll_tables 的轉場定義一致；首案住家通勤以 travel_home_weight 計。
+    # 大眾運輸居服員改用直線距離估算，比較派法時不額外觸發 Google 查詢；可不可派仍由 check_visit 決定。
+    travel_mode = str(getattr(config,'travel_objective_mode','off') or 'off')
+    travel_weight = max(0.0,finite(getattr(config,'travel_objective_weight',1.0),1.0))
+    home_weight = max(0.0,finite(getattr(config,'travel_home_weight',0.0),0.0))
+    leg_cache = {}
+
+    def leg_minutes(worker,a,b):
+        transit = profiles[worker].get('常用交通工具')=='大眾運輸'
+        key = (*a,*b,transit)
+        if key not in leg_cache:
+            if not all(v==v for v in (*a,*b)):
+                leg_cache[key] = 0.0
+            else:
+                try:
+                    leg_cache[key] = (calc_distance_km(*a,*b)*float(config.travel_min_per_km) if transit
+                                      else float(calc_travel_minutes(*a,*b,config)))
+                except Exception:
+                    leg_cache[key] = calc_distance_km(*a,*b)*float(config.travel_min_per_km)
+        return leg_cache[key]
+
+    def route_cost(worker,day,tids,paid_only=False):
+        # paid_only：只算付費轉場（不同案家間車程＋緩衝），不含首案住家通勤。
+        lookup = config.dispatch_cache['days'][id(days[day])]['lookup']
+        profile = profiles[worker]
+        previous,previous_client,cost = None,None,0.0
+        for tid in sorted(tids,key=lambda t:(lookup[t]['時間窗_開始'],t)):
+            row = lookup[tid]
+            here = finite(row.get('服務地點_緯度')),finite(row.get('服務地點_經度'))
+            if previous is None:
+                if paid_only:
+                    previous,previous_client = here,str(row['案家ID'])
+                    continue
+                home = finite(profile.get('服務起點_緯度(家)')),finite(profile.get('服務起點_經度(家)'))
+                cost += home_weight*leg_minutes(worker,home,here)
+            elif str(row['案家ID']) != previous_client:
+                cost += leg_minutes(worker,previous,here)+config.buffer_mins
+            previous,previous_client = here,str(row['案家ID'])
+        return cost
+
+    def worker_ids(frame,worker):
+        return list(frame['任務ID'].to_numpy()[frame['派單居服員'].astype(str).to_numpy()==str(worker)]) if len(frame) else []
+
+    def added_cost(worker,frames):
+        """frames：{日期: 加入後的當日班表}；回傳相對 assigned 的新增轉場成本。"""
+        return sum(route_cost(worker,day,worker_ids(frame,worker))-route_cost(worker,day,worker_ids(assigned[day],worker))
+                   for day,frame in frames.items())
+
+    def objective(served_count,cost):
+        # 派出一筆＝1,000,000；轉場成本再大也不會超過一筆服務的價值，派出數永遠優先。
+        return served_count*1_000_000-travel_weight*cost
+
     # Reserve each fixed worker's weekly route once, then copy identical days.
     for i,(day,frame) in enumerate(days.items()):
         if progress:
@@ -441,7 +495,8 @@ def _run_expanded_dispatch(tasks,caregivers,clients,config,primary_map=None,prog
                     task_errors[task['任務ID']] = reason
                 else:
                     potentially_available.append(task)
-            if best and sum(float(t.get('_template_occurrences',1)) for t in potentially_available) <= coverage(best[1]):
+            potential = sum(float(t.get('_template_occurrences',1)) for t in potentially_available)
+            if best and (potential < coverage(best[1]) if travel_mode=='weighted' else potential <= coverage(best[1])):
                 continue
             for _,task in visits.iterrows():
                 if leave_overlap(task,profiles[worker]):
@@ -459,12 +514,18 @@ def _run_expanded_dispatch(tasks,caregivers,clients,config,primary_map=None,prog
                 tentative[day] = pd.concat([current,pd.DataFrame([{'任務ID':task['任務ID'],'派單居服員':worker}])],ignore_index=True)
                 trial.work_day_minutes[(worker,day)] = checked['working_minutes']
                 trial.worker_workdays.setdefault(worker,set()).add(str(day)[:10])
+            if travel_mode=='weighted':
+                # 不在第一位排滿的人停下：同樣排滿時比較整期新增轉場。
+                score = objective(coverage(checked_rows),added_cost(worker,tentative)) if checked_rows else None
+                if checked_rows and (best is None or score>best[3]):
+                    best = worker,checked_rows,task_errors,score
+                continue
             if checked_rows and (best is None or coverage(checked_rows)>coverage(best[1])):
-                best = worker,checked_rows,task_errors
+                best = worker,checked_rows,task_errors,None
             if len(checked_rows)+sum(bool(leave_overlap(task,profiles[worker])) for _,task in visits.iterrows())==len(visits):
                 break
         if best:
-            worker,checked_rows,task_errors = best
+            worker,checked_rows,task_errors,_ = best
             owners[client] = worker
             for key in [k for k in overlap_cache if k[1]==worker]:
                 del overlap_cache[key]
@@ -545,22 +606,48 @@ def _run_expanded_dispatch(tasks,caregivers,clients,config,primary_map=None,prog
         ordered = _sub_order(profiles_)
         return [p['worker'] for p in ordered],{p['worker']:p for p in ordered}
 
+    def sub_tier(info):
+        # 代班順序的前兩層（月加班近上限者最後、服務過此案家者優先）視為連續性政策，轉場只在同一層內比較。
+        return bool(info['skipped']),not (bool(info['familiar']) and not info['demoted'])
+
+    def pick_substitute(task,candidates,rank_info,reasons,before=None,after=None):
+        """off：代班順序第一位可行者。weighted：同一層可行者中新增轉場最少者（平手維持原順序）。"""
+        day = task['日期']
+        best,tier = None,None
+        for worker in candidates:
+            worker = str(worker)
+            if tier is not None and sub_tier(rank_info[worker])!=tier:
+                break
+            if before:
+                before(worker)
+            checked = check_visit(task,worker,assigned[day],config)
+            if after:
+                after(worker)
+            if not checked['available']:
+                reasons[worker] = checked['detail']
+                continue
+            if travel_mode!='weighted':
+                return worker,checked
+            frame = pd.concat([assigned[day],pd.DataFrame([{'任務ID':task['任務ID'],'派單居服員':worker}])],ignore_index=True)
+            score = objective(1,added_cost(worker,{day:frame}))
+            if best is None or score>best[2]:
+                best = worker,checked,score
+            tier = sub_tier(rank_info[worker])
+        return best[:2] if best else None
+
     for i,task in enumerate(leave_tasks):
         if progress:
             progress(.85+.1*i/max(len(leave_tasks),1),f'核對請假代班 {i+1}/{len(leave_tasks)}')
-        day = task['日期']
         scored = run_phase1_matching(pd.DataFrame([task]),caregivers,config)
         reasons = {}
         # 請假代班不再依適配度分數（含滿意度與住家距離）排序，改用代班挑選順序。
         candidates,rank_info = substitute_order(task,scored['居服員ID'].astype(str).tolist() if not scored.empty else [])
-        for worker in candidates:
-            checked = check_visit(task,str(worker),assigned[day],config)
-            if checked['available']:
-                rankings.setdefault(str(task['案家ID']),{}).update(scored.set_index('居服員ID').to_dict('index'))
-                commit(task,str(worker),checked,leave_overlap(task,profiles.get(owners[str(task['案家ID'])])),
-                       rank_reason=rank_info[str(worker)]['reason'])
-                break
-            reasons[str(worker)] = checked['detail']
+        picked = pick_substitute(task,candidates,rank_info,reasons)
+        if picked:
+            worker,checked = picked
+            rankings.setdefault(str(task['案家ID']),{}).update(scored.set_index('居服員ID').to_dict('index'))
+            commit(task,worker,checked,leave_overlap(task,profiles.get(owners[str(task['案家ID'])])),
+                   rank_reason=rank_info[worker]['reason'])
         else:
             note(task,'請假代班','固定人選請假，沒有通過資格、交通與工時檢查的代班人選。',reasons,len(scored))
 
@@ -642,13 +729,26 @@ def _run_expanded_dispatch(tasks,caregivers,clients,config,primary_map=None,prog
                 best = None
                 for worker in (w for w in ranked if w not in backups.get(client,())):
                     accepted = try_backup(client,visits,worker)
+                    if travel_mode=='weighted':
+                        # 承接筆數優先，其次歷史備援，再比整期新增轉場；不在第一位排滿的人停下。
+                        if accepted:
+                            frames = {}
+                            for task,_ in accepted:
+                                day = task['日期']
+                                frames[day] = pd.concat([frames.get(day,assigned[day]),
+                                    pd.DataFrame([{'任務ID':task['任務ID'],'派單居服員':worker}])],ignore_index=True)
+                            score = (objective(len(accepted),0.0),worker in seed_backups.get(client,()),
+                                     -travel_weight*added_cost(worker,frames))
+                            if best is None or score>best[2]:
+                                best = worker,accepted,score
+                        continue
                     if accepted and (best is None or len(accepted)>len(best[1])):
-                        best = worker,accepted
+                        best = worker,accepted,None
                     if len(accepted)==len(visits):
                         break
                 if not best:
                     break
-                worker,accepted = best
+                worker,accepted,_ = best
                 backups[client] = backups.get(client,())+(worker,)
                 for task,checked in accepted:
                     _,_info = substitute_order(task,[worker])
@@ -805,17 +905,195 @@ def _run_expanded_dispatch(tasks,caregivers,clients,config,primary_map=None,prog
                 tid = str(task['任務ID'])
                 # 每一筆依當天實際的前一案重新排序；已支援過本案的人因「服務過」自然排在前面。
                 ordered,rank_info = substitute_order(task,helpers+[w for w in pool if w not in helpers])
-                for worker in ordered:
+                picked = pick_substitute(task,ordered,rank_info,{},before=lambda w:supports.__setitem__(tid,w),
+                                         after=lambda w:supports.pop(tid,None))
+                if picked:
+                    worker,checked = picked
                     supports[tid] = worker
-                    checked = check_visit(task,worker,assigned[task['日期']],config)
-                    if checked['available']:
-                        commit(task,worker,checked,source='臨時支援',rank_reason=rank_info[worker]['reason'])
-                        rescued.add(task['任務ID'])
-                        support_services += 1
-                        if worker not in helpers:
-                            helpers.append(worker)
-                        break
-                    del supports[tid]
+                    commit(task,worker,checked,source='臨時支援',rank_reason=rank_info[worker]['reason'])
+                    rescued.add(task['任務ID'])
+                    support_services += 1
+                    if worker not in helpers:
+                        helpers.append(worker)
+
+    # ---- 第二階段（two_stage）：降低轉場的局部搬移與交換 ----
+    # 只動非主責服務（請假代班、固定備援、臨時支援）；主責服務一筆都不動，派出數也不變。
+    # 每一步都重新通過 check_visit（資格、請假、時段、交通空檔、休息、日／月工時、連續上班），
+    # 且精確的「居服員×日」付費轉場（不含住家通勤）至少少 travel_stage2_min_gain_minutes 分才接受，所以任何時刻的班表都是可行解；
+    # 逾時就停在目前已驗證的解（不會比第一階段差）。固定備援服務只在該案既有備援之間調動，
+    # 不新增備援人數；臨時支援可換成主責＋備援以外的人；請假代班可換成主責以外的人。
+    stage2 = {'moves':0,'swaps':0,'estimated_saved_minutes':0.0,'seconds':0.0,'timed_out':False}
+    if allow_backup and travel_mode=='two_stage' and rows:
+        started = time.perf_counter()
+        deadline = started+max(0.0,finite(getattr(config,'travel_stage2_seconds',0.0),0.0))
+        row_at = {r['任務ID']:i for i,r in enumerate(rows)}
+        match_at = {m['任務ID']:i for i,m in enumerate(matches)}
+        movable_sources = ('請假代班','備援居服員','臨時支援')
+        # 只看付費轉場、且至少省 travel_stage2_min_gain_minutes 分才換人，避免為了一兩分鐘通勤就改派。
+        gain_floor = max(0.01,finite(getattr(config,'travel_stage2_min_gain_minutes',5.0),5.0))
+        paid = lambda worker,day,tids:route_cost(worker,day,tids,paid_only=True)
+        first_worker,saved_by_task = {},{}   # 任務ID → 第一階段原派居服員／累計省下的估計分鐘
+
+        def movable():
+            return [r for r in rows if r['排班來源'] in movable_sources]
+
+        def allowed(row):
+            client,now = str(row['案家ID']),str(row['派單居服員'])
+            owner = owners.get(client)
+            if row['排班來源']=='備援居服員':
+                pool = backups.get(client,())
+            elif row['排班來源']=='臨時支援':
+                pool = [w for w in profiles if w!=owner and w not in backups.get(client,())]
+            else:
+                pool = [w for w in profiles if w!=owner]
+            return [w for w in pool if w!=now]
+
+        def check_as(tid,worker,frame):
+            support = rows[row_at[tid]]['排班來源']=='臨時支援'
+            previous = supports.get(str(tid))
+            if support:
+                supports[str(tid)] = worker
+            try:
+                return check_visit(task_records[tid],worker,frame,config)
+            finally:
+                if support:
+                    supports[str(tid)] = previous
+
+        def day_minutes(worker,day,frame):
+            ids = worker_ids(frame,worker)
+            if not ids:
+                return 0.0
+            checked = check_as(ids[0],worker,frame[frame['任務ID'].ne(ids[0])])
+            return checked['working_minutes'] if checked['available'] else None
+
+        def keeps_team(changes):
+            # 不增加案家的搭配人數：接手者已服務過該案，或原服務者只剩這一筆（換人後人數不變）。
+            for tid,old,new in changes:
+                client = str(task_records[tid]['案家ID'])
+                if not served[(client,new)] and served[(client,old)] > 1:
+                    return False
+            return True
+
+        def overtime(day,minutes):
+            return sum(max(0.0,m/60-config.normal_daily_hours) for m in minutes.values())
+
+        def no_extra_overtime(day,minutes):
+            # 轉場省下的分鐘若換來加班（1.34 倍工資）就不划算：相關居服員當天加班不得增加。
+            before = {w:config.work_day_minutes.get((w,day),0.0) for w in minutes}
+            return overtime(day,minutes) <= overtime(day,before)+1e-9
+
+        def with_rows(frame,pairs):
+            return pd.concat([frame,pd.DataFrame([{'任務ID':t,'派單居服員':w} for t,w in pairs])],ignore_index=True)
+
+        def apply(changes,day,frame,minutes,gain):
+            assigned[day] = frame
+            for worker,value in minutes.items():
+                set_work_minutes(worker,day,value)
+                if not value:
+                    config.work_day_minutes.pop((worker,day),None)
+            for tid,old,new in changes:
+                task = task_records[tid]
+                if not worker_ids(frame,old):
+                    config.worker_workdays.get(old,set()).discard(str(day)[:10])
+                config.worker_workdays.setdefault(new,set()).add(str(day)[:10])
+                occupied_slots[(old,day)] = [t for t in occupied_slots.get((old,day),[]) if t['任務ID']!=tid]
+                occupied_slots.setdefault((new,day),[]).append(task)
+                client = str(task['案家ID'])
+                served[(client,old)] -= 1
+                served[(client,new)] += 1
+                row = rows[row_at[tid]]
+                row['派單居服員'] = new
+                # 原本的排序理由描述的是第一階段的人選，改派後不再適用；改寫成改派說明（多次改派只留一句）。
+                first_worker.setdefault(tid,old)
+                saved_by_task[tid] = saved_by_task.get(tid,0.0)+gain
+                row['代班排序理由'] = (f'轉場最佳化改派：原派 {first_worker[tid]}，改派後估計轉場少 {saved_by_task[tid]:.0f} 分'
+                                   if first_worker[tid]!=new else '轉場最佳化後維持原派')
+                matches[match_at[tid]] = _match_row(task,new,profiles,rankings,config,historical)
+                if row['排班來源']=='臨時支援':
+                    supports[str(tid)] = new
+
+        def relocate(row):
+            tid,a,day = row['任務ID'],str(row['派單居服員']),row['排班日期']
+            frame = assigned[day]
+            without = frame[frame['任務ID'].ne(tid)]
+            ids_a = worker_ids(frame,a)
+            left = paid(a,day,[t for t in ids_a if t!=tid])-paid(a,day,ids_a)
+            for b in allowed(row):
+                ids_b = worker_ids(frame,b)
+                gain = -(left+paid(b,day,ids_b+[tid])-paid(b,day,ids_b))
+                if gain < gain_floor or not keeps_team([(tid,a,b)]):
+                    continue
+                checked = check_as(tid,b,without)
+                if not checked['available']:
+                    continue
+                final = with_rows(without,[(tid,b)])
+                minutes_a = day_minutes(a,day,final)
+                if minutes_a is None:
+                    continue
+                minutes = {b:checked['working_minutes'],a:minutes_a}
+                if not no_extra_overtime(day,minutes):
+                    continue
+                apply([(tid,a,b)],day,final,minutes,gain)
+                return gain
+            return 0.0
+
+        def swap(r1,r2):
+            t1,t2,day = r1['任務ID'],r2['任務ID'],r1['排班日期']
+            a,b = str(r1['派單居服員']),str(r2['派單居服員'])
+            if a==b or b not in allowed(r1) or a not in allowed(r2):
+                return 0.0
+            frame = assigned[day]
+            ids_a,ids_b = worker_ids(frame,a),worker_ids(frame,b)
+            gain = (paid(a,day,ids_a)+paid(b,day,ids_b)
+                    -paid(a,day,[t for t in ids_a if t!=t1]+[t2])-paid(b,day,[t for t in ids_b if t!=t2]+[t1]))
+            if gain < gain_floor or not keeps_team([(t1,a,b),(t2,b,a)]):
+                return 0.0
+            base = frame[~frame['任務ID'].isin([t1,t2])]
+            first = check_as(t1,b,base)
+            if not first['available']:
+                return 0.0
+            middle = with_rows(base,[(t1,b)])
+            second = check_as(t2,a,middle)
+            if not second['available']:
+                return 0.0
+            minutes = {b:first['working_minutes'],a:second['working_minutes']}
+            if not no_extra_overtime(day,minutes):
+                return 0.0
+            apply([(t1,a,b),(t2,b,a)],day,with_rows(middle,[(t2,a)]),minutes,gain)
+            return gain
+
+        def out_of_time():
+            stage2['timed_out'] = time.perf_counter() > deadline
+            return stage2['timed_out']
+
+        if progress:
+            progress(.95,'轉場最佳化（第二階段）')
+        improved = True
+        while improved and not out_of_time():
+            improved = False
+            for row in movable():
+                if out_of_time():
+                    break
+                gain = relocate(row)
+                if gain:
+                    stage2['moves'] += 1
+                    stage2['estimated_saved_minutes'] += gain
+                    improved = True
+            by_day = {}
+            for row in movable():
+                by_day.setdefault(row['排班日期'],[]).append(row)
+            for day,group in sorted(by_day.items()):
+                for i in range(len(group)):
+                    for j in range(i+1,len(group)):
+                        if out_of_time():
+                            break
+                        gain = swap(group[i],group[j])
+                        if gain:
+                            stage2['swaps'] += 1
+                            stage2['estimated_saved_minutes'] += gain
+                            improved = True
+        stage2['seconds'] = round(time.perf_counter()-started,2)
+        stage2['estimated_saved_minutes'] = round(stage2['estimated_saved_minutes'],1)
     diagnostics[:] = [d for d in diagnostics if d['任務ID'] not in rescued]
     if time_shifts:
         moved = {t['任務ID']:t for t in time_shifts}
@@ -844,7 +1122,8 @@ def _run_expanded_dispatch(tasks,caregivers,clients,config,primary_map=None,prog
         'dispatch_stats':{'historical_clients':len(historical),'new_clients':total_new,'ownership_search_clients':total_new,
                           'copied_worker_days':copied_days,'checked_worker_days':checked_days,
                           'backup_clients':len(backups),'backup_services':backup_services,'support_services':support_services,
-                          'time_shifted_services':len(time_shifts),'time_shift_fail_reasons':dict(shift_fail)}}
+                          'time_shifted_services':len(time_shifts),'time_shift_fail_reasons':dict(shift_fail),
+                          'travel_objective_mode':travel_mode,'travel_stage2':stage2}}
 
 
 def _match_row(task,worker,profiles,rankings,config,historical):
