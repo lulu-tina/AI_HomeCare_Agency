@@ -3326,7 +3326,8 @@ if "last_result" in st.session_state:
                        "🩺 個案照顧需求變更": "needchange"}
         _demo_kind = _demo_kinds.get(_dynamic_event_type)
         _demo_buttons = ([('new1', '🎬 範例1：劉O 就醫陪同（單次）'), ('new2', '🎬 範例2：樓O志 失智（三次）')] if _demo_kind == 'new'
-                         else [('dementia', '🎬 範例：DEMO0005 新增失智'), ('foot', '🎬 範例：DEMO0004 新增足部照護')] if _demo_kind == 'needchange'
+                         else [('dementia', '🎬 範例：DEMO0005 新增失智（陪同交接）'), ('foot', '🎬 範例：DEMO0004 新增足部照護（補訓後回任）'),
+                               ('needsplit', '🎬 範例：一位接不完（立即改派）')] if _demo_kind == 'needchange'
                          else [(_demo_kind, '🎬 載入示範案例')])
 
         def _demo_context():
@@ -3380,8 +3381,11 @@ if "last_result" in st.session_state:
                 st.session_state['qual_need'] = found['need']
                 st.session_state['qual_client'] = client
                 st.session_state['qual_since'] = pd.Timestamp(found['since']).date()
-                st.session_state['qual_method'] = 'now'
+                # 三個範例各示範一種處理方式：失智→熟面孔陪同交接、足部→補訓後回任、一位接不完→立即改派
+                st.session_state['qual_method'] = {'dementia': 'handover', 'foot': 'grace'}.get(kind, 'now')
                 st.session_state.pop('qual_avail', None)
+                st.session_state.pop('qual_handover_n', None)              # 陪同次數回到預設 2 次
+                st.session_state.pop(f'qual_deadline_{client}', None)      # 補訓期限回到預設生效日後 60 天
                 if found.get('split'):
                     _plan = '、'.join(f"{g['星期']}→{caregiver_label(g['居服員'])}" for g in found['split']['groups'])
                     st.session_state['qual_method'] = 'now'
@@ -3389,13 +3393,18 @@ if "last_result" in st.session_state:
                             f"照專複評後新增{'失智' if found['need'] == 'dementia' else ' BA08 足部照護'}，原居服員沒有訓練。"
                             f"有訓練的居服員裡沒有一位能接下全部 {len(found['tasks'])} 次（時段撞到其他案家或工時），"
                             f"所以系統依星期分給 {found['options']} 位：{_plan}。下方已選「立即改派」（法規只能派給有訓練的人）。")
-                _story = ('照專複評後確認失智，但 {w} 沒有失智症照顧服務 20 小時訓練' if kind == 'dementia' else
-                          '照專複評後核定新增 BA08 足部照護（例如糖尿病足、趾甲增厚），但 {w} 沒有足部照護訓練')
-                return (f"示範：{client_label(client)} 一直由 {caregiver_label(found['worker'])} 服務（本期 {len(found['tasks'])} 筆），"
-                        + _story.format(w=caregiver_label(found['worker'])) + "。下方已帶入需求、案家與生效日，"
-                        f"法規只能派給有訓練的人，預設「立即改派」；也可加上原居服員陪同交接，或追蹤原居服員補訓後回任。"
-                        f"有訓練又能接下全部服務的有 {found['options']} 位，推薦 {caregiver_label(found['top'])}"
-                        f"（{_label_ids_plain(found['reason'])}）。")
+                _w, _top = caregiver_label(found['worker']), caregiver_label(found['top'])
+                if kind == 'dementia':
+                    _story = (f"照專複評後確認失智，但 {_w} 沒有失智症照顧服務 20 小時訓練，依法規不能再服務。"
+                              f"長輩長期只認得 {_w}，突然換人容易拒絕服務，所以下方已選「② 熟面孔陪同交接」："
+                              f"從第一次起改由 {_top} 服務，前 2 次 {_w} 陪同介紹、安撫長輩（不提供服務、不申報）。")
+                else:
+                    _story = (f"照專複評後核定新增 BA08 足部照護（例如糖尿病足、趾甲增厚），但 {_w} 沒有足部照護訓練，依法規不能再服務。"
+                              f"{_w} 願意去上 10 小時課程，所以下方已選「③ 補訓後回任」：服務立即改由 {_top}，"
+                              f"{_w} 的補訓期限（生效日後 60 天）記入追蹤清單，取得資格後可評估改回主責。")
+                return (f"示範：{client_label(client)} 一直由 {_w} 服務（本期 {len(found['tasks'])} 筆）。" + _story
+                        + f"有訓練又能接下全部服務的有 {found['options']} 位，推薦 {_top}（{_label_ids_plain(found['reason'])}）。"
+                        "可切換其他處理方式比較。")
             if kind in ('new1', 'new2'):
                 # 先只把整段 LINE 訊息放進輸入框並顯示原文，讓居督看到「收到什麼」；按「解析並定位」後才出現解析結果。
                 st.session_state["tc_raw"] = found['message']
